@@ -46,7 +46,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>app.Main</mainClass>
+                            <mainClass>app.ExporterMain</mainClass>
                         </manifest>
                     </archive>
                     <descriptorRefs>

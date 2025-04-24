@@ -1,29 +1,22 @@
 package app.common.storage;
 
-import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration;
-import software.amazon.awssdk.awscore.exception.AwsServiceException;
-import software.amazon.awssdk.awscore.internal.AwsErrorCode;
-import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ServiceClientConfiguration;
 import software.amazon.awssdk.services.s3.model.*;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
-import software.amazon.awssdk.utils.builder.SdkBuilder;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Consumer;
 
 /**
  * A test implementation of S3Client for unit testing S3StorageProvider.
@@ -102,7 +95,12 @@ public class TestS3Client implements S3Client {
     public PutObjectResponse putObject(PutObjectRequest request, RequestBody requestBody) {
         try {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            requestBody.writeTo(baos);
+            InputStream is = requestBody.contentStreamProvider().newStream();
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = is.read(buffer)) != -1) {
+                baos.write(buffer, 0, bytesRead);
+            }
             putObjectInMaps(request.key(), baos.toByteArray());
             return PutObjectResponse.builder().build();
         } catch (IOException e) {
@@ -130,7 +128,7 @@ public class TestS3Client implements S3Client {
     public <T> T getObject(GetObjectRequest request, ResponseTransformer<GetObjectResponse, T> responseTransformer) {
         ResponseInputStream<GetObjectResponse> responseInputStream = getObject(request);
         try {
-            return responseTransformer.transform(responseInputStream.response(), responseInputStream);
+            return responseTransformer.transform(responseInputStream.response(), AbortableInputStream.create(responseInputStream));
         } catch (Exception e) {
             throw new RuntimeException("Failed to transform response", e);
         }
@@ -388,7 +386,7 @@ public class TestS3Client implements S3Client {
     }
     
     @Override
-    public GetObjectTorrentResponse getObjectTorrent(GetObjectTorrentRequest getObjectTorrentRequest) {
+    public ResponseInputStream<GetObjectTorrentResponse> getObjectTorrent(GetObjectTorrentRequest getObjectTorrentRequest) {
         throw new UnsupportedOperationException("Not implemented in test client");
     }
     
@@ -396,12 +394,7 @@ public class TestS3Client implements S3Client {
     public GetPublicAccessBlockResponse getPublicAccessBlock(GetPublicAccessBlockRequest getPublicAccessBlockRequest) {
         throw new UnsupportedOperationException("Not implemented in test client");
     }
-    
-    @Override
-    public InitiateMultipartUploadResponse initiateMultipartUpload(InitiateMultipartUploadRequest initiateMultipartUploadRequest) {
-        throw new UnsupportedOperationException("Not implemented in test client");
-    }
-    
+
     @Override
     public ListBucketAnalyticsConfigurationsResponse listBucketAnalyticsConfigurations(ListBucketAnalyticsConfigurationsRequest listBucketAnalyticsConfigurationsRequest) {
         throw new UnsupportedOperationException("Not implemented in test client");
@@ -581,12 +574,7 @@ public class TestS3Client implements S3Client {
     public RestoreObjectResponse restoreObject(RestoreObjectRequest restoreObjectRequest) {
         throw new UnsupportedOperationException("Not implemented in test client");
     }
-    
-    @Override
-    public SelectObjectContentResponseHandler selectObjectContent(SelectObjectContentRequest selectObjectContentRequest, ResponseTransformer<SelectObjectContentResponse, SelectObjectContentResponseHandler> responseTransformer) {
-        throw new UnsupportedOperationException("Not implemented in test client");
-    }
-    
+
     @Override
     public UploadPartResponse uploadPart(UploadPartRequest uploadPartRequest, RequestBody requestBody) {
         throw new UnsupportedOperationException("Not implemented in test client");
@@ -607,18 +595,4 @@ public class TestS3Client implements S3Client {
         throw new UnsupportedOperationException("Not implemented in test client");
     }
 
-    @Override
-    public S3Client copy() {
-        throw new UnsupportedOperationException("Not implemented in test client");
-    }
-
-    @Override
-    public S3Client copy(Consumer<? extends SdkBuilder<?, ?>> consumer) {
-        throw new UnsupportedOperationException("Not implemented in test client");
-    }
-
-    @Override
-    public Region region() {
-        return Region.US_EAST_1;
-    }
 }

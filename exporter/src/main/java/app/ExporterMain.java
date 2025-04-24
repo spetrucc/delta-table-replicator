@@ -1,6 +1,6 @@
 package app;
 
-import app.importer.DeltaTableImporter;
+import app.exporter.DeltaTableExporter;
 import app.common.storage.StorageProvider;
 import app.common.storage.StorageProviderFactory;
 import org.apache.commons.cli.*;
@@ -13,11 +13,11 @@ import java.nio.file.Paths;
 import java.util.UUID;
 
 /**
- * Main entry point for the Delta Table Importer application.
- * This application imports Delta Lake tables from a ZIP archive to a target location.
+ * Main entry point for the Delta Table Exporter application.
+ * This application exports Delta Lake tables from S3 or local filesystem to a local ZIP archive.
  */
-public class Main {
-    private static final Logger LOG = LoggerFactory.getLogger(Main.class);
+public class ExporterMain {
+    private static final Logger LOG = LoggerFactory.getLogger(ExporterMain.class);
 
     public static void main(String[] args) {
         // Define command line options
@@ -31,28 +31,35 @@ public class Main {
 
             // Display help if requested
             if (cmd.hasOption("h")) {
-                formatter.printHelp("delta-table-importer", options);
+                formatter.printHelp("delta-table-replicator", options);
                 return;
             }
 
             // Validate required options
-            if (!cmd.hasOption("z")) {
-                throw new ParseException("Missing required option: zip-file");
+            if (!cmd.hasOption("s")) {
+                throw new ParseException("Missing required option: table-path");
             }
 
-            if (!cmd.hasOption("t")) {
-                throw new ParseException("Missing required option: target-path");
+            if (!cmd.hasOption("o")) {
+                throw new ParseException("Missing required option: output-zip");
             }
 
             // Extract command line parameters
-            String zipFilePath = cmd.getOptionValue("z");
-            String targetPath = cmd.getOptionValue("t");
-            boolean overwrite = cmd.hasOption("o");
-            boolean mergeSchema = cmd.hasOption("m");
+            String tablePath = cmd.getOptionValue("s");
+            String outputZipPath = cmd.getOptionValue("o");
+            long fromVersion = Long.parseLong(cmd.getOptionValue("f", "0"));
+            
+            // Parse max ZIP size if provided
+            long maxZipSize = 2L * 1024 * 1024 * 1024; // Default 2GB
+            if (cmd.hasOption("m")) {
+                String maxZipSizeStr = cmd.getOptionValue("m");
+                maxZipSize = parseSize(maxZipSizeStr);
+                LOG.info("Using maximum ZIP volume size: {} bytes", maxZipSize);
+            }
             
             // Create temporary directory
             String tempDir = cmd.getOptionValue("tmp", 
-                    System.getProperty("java.io.tmpdir") + "/delta-import-" + UUID.randomUUID());
+                    System.getProperty("java.io.tmpdir") + "/delta-export-" + UUID.randomUUID());
             
             // Extract S3 configuration if needed
             String accessKey = cmd.getOptionValue("ak");
@@ -60,23 +67,23 @@ public class Main {
             String endpoint = cmd.getOptionValue("e");
             boolean pathStyleAccess = cmd.hasOption("psa");
             
-            // Create storage provider based on the target path
+            // Create storage provider based on the table path
             StorageProvider storageProvider;
-            if (targetPath.startsWith("s3://") || targetPath.startsWith("s3a://")) {
+            if (tablePath.startsWith("s3://") || tablePath.startsWith("s3a://")) {
                 LOG.info("Using S3 storage provider with provided credentials");
                 storageProvider = StorageProviderFactory.createProvider(
-                        targetPath, accessKey, secretKey, endpoint, pathStyleAccess);
+                        tablePath, accessKey, secretKey, endpoint, pathStyleAccess);
             } else {
                 LOG.info("Using local storage provider");
-                storageProvider = StorageProviderFactory.createProvider(targetPath);
+                storageProvider = StorageProviderFactory.createProvider(tablePath);
             }
             
-            // Create and run the importer
-            DeltaTableImporter importer = new DeltaTableImporter(
-                    zipFilePath, targetPath, tempDir, overwrite, mergeSchema, storageProvider);
+            // Create and run the exporter
+            DeltaTableExporter exporter = new DeltaTableExporter(
+                    tablePath, fromVersion, outputZipPath, tempDir, storageProvider, maxZipSize);
             
-            LOG.info("Starting Delta Table import process");
-            importer.importTable();
+            LOG.info("Starting Delta Table export process");
+            String finalOutputPath = exporter.export();
             
             // Clean up temporary directory if requested
             if (cmd.hasOption("c")) {
@@ -92,14 +99,14 @@ public class Main {
                         });
             }
             
-            LOG.info("Delta Table import completed successfully");
+            LOG.info("Delta Table export completed successfully. Final output path: {}", finalOutputPath);
             
         } catch (ParseException e) {
             LOG.error("Error parsing command line arguments: {}", e.getMessage());
-            formatter.printHelp("delta-table-importer", options);
+            formatter.printHelp("delta-table-replicator", options);
             System.exit(1);
         } catch (Exception e) {
-            LOG.error("Error during Delta Table import", e);
+            LOG.error("Error during Delta Table export", e);
             System.exit(1);
         }
     }
@@ -113,29 +120,33 @@ public class Main {
         Options options = new Options();
         
         // Required options
-        options.addOption(Option.builder("z")
-                .longOpt("zip-file")
-                .desc("Path to the ZIP file containing the Delta table export")
+        options.addOption(Option.builder("s")
+                .longOpt("table-path")
+                .desc("Path to the Delta table (s3a://bucket/path/to/table or file:///path/to/table)")
                 .hasArg()
                 .required()
                 .build());
         
-        options.addOption(Option.builder("t")
-                .longOpt("target-path")
-                .desc("Path where the Delta table will be created (s3a://bucket/path/to/table or file:///path/to/table)")
-                .hasArg()
-                .required()
-                .build());
-        
-        // Import options
         options.addOption(Option.builder("o")
-                .longOpt("overwrite")
-                .desc("Overwrite the target table if it exists")
+                .longOpt("output-zip")
+                .desc("Local path where the ZIP file will be created")
+                .hasArg()
+                .required()
                 .build());
         
+        // Optional version range
+        options.addOption(Option.builder("f")
+                .longOpt("from-version")
+                .desc("Starting version to export (inclusive, default: 0)")
+                .hasArg()
+                .build());
+        
+        // ZIP file options
         options.addOption(Option.builder("m")
-                .longOpt("merge-schema")
-                .desc("Merge the schema with the existing table if it exists")
+                .longOpt("max-zip-size")
+                .desc("Maximum size of each ZIP volume in bytes (default: 2GB). " +
+                      "Use suffixes K, M, or G for kilobytes, megabytes, or gigabytes.")
+                .hasArg()
                 .build());
         
         // S3 configuration options
@@ -165,13 +176,13 @@ public class Main {
         // Other options
         options.addOption(Option.builder("tmp")
                 .longOpt("temp-dir")
-                .desc("Temporary directory to use for extracting files")
+                .desc("Temporary directory to use for downloading files")
                 .hasArg()
                 .build());
         
         options.addOption(Option.builder("c")
                 .longOpt("cleanup")
-                .desc("Clean up temporary directory after import")
+                .desc("Clean up temporary directory after export")
                 .build());
         
         options.addOption(Option.builder("h")
@@ -180,5 +191,34 @@ public class Main {
                 .build());
         
         return options;
+    }
+
+    /**
+     * Parses a size string like "1G" or "500M" into bytes.
+     *
+     * @param sizeStr The size string to parse (e.g. "1G", "500M", "1024K", "1048576")
+     * @return The size in bytes
+     */
+    private static long parseSize(String sizeStr) {
+        sizeStr = sizeStr.trim().toUpperCase();
+        long multiplier = 1;
+        
+        if (sizeStr.endsWith("K")) {
+            multiplier = 1024L;
+            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
+        } else if (sizeStr.endsWith("M")) {
+            multiplier = 1024L * 1024L;
+            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
+        } else if (sizeStr.endsWith("G")) {
+            multiplier = 1024L * 1024L * 1024L;
+            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
+        }
+        
+        try {
+            return Long.parseLong(sizeStr) * multiplier;
+        } catch (NumberFormatException e) {
+            LOG.warn("Invalid size format: {}. Using default size.", sizeStr);
+            return 2L * 1024L * 1024L * 1024L; // Default to 2GB
+        }
     }
 }

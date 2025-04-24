@@ -1,6 +1,6 @@
 package app;
 
-import app.exporter.DeltaTableExporter;
+import app.importer.DeltaTableImporter;
 import app.common.storage.StorageProvider;
 import app.common.storage.StorageProviderFactory;
 import org.apache.commons.cli.*;
@@ -13,11 +13,11 @@ import java.nio.file.Paths;
 import java.util.UUID;
 
 /**
- * Main entry point for the Delta Table Exporter application.
- * This application exports Delta Lake tables from S3 or local filesystem to a local ZIP archive.
+ * Main entry point for the Delta Table Importer application.
+ * This application imports Delta Lake tables from a ZIP archive to a target location.
  */
-public class Main {
-    private static final Logger LOG = LoggerFactory.getLogger(Main.class);
+public class ImporterMain {
+    private static final Logger LOG = LoggerFactory.getLogger(ImporterMain.class);
 
     public static void main(String[] args) {
         // Define command line options
@@ -31,27 +31,28 @@ public class Main {
 
             // Display help if requested
             if (cmd.hasOption("h")) {
-                formatter.printHelp("delta-table-replicator", options);
+                formatter.printHelp("delta-table-importer", options);
                 return;
             }
 
             // Validate required options
-            if (!cmd.hasOption("s")) {
-                throw new ParseException("Missing required option: table-path");
+            if (!cmd.hasOption("z")) {
+                throw new ParseException("Missing required option: zip-file");
             }
 
-            if (!cmd.hasOption("o")) {
-                throw new ParseException("Missing required option: output-zip");
+            if (!cmd.hasOption("t")) {
+                throw new ParseException("Missing required option: target-path");
             }
 
             // Extract command line parameters
-            String tablePath = cmd.getOptionValue("s");
-            String outputZipPath = cmd.getOptionValue("o");
-            long fromVersion = Long.parseLong(cmd.getOptionValue("f", "0"));
+            String zipFilePath = cmd.getOptionValue("z");
+            String targetPath = cmd.getOptionValue("t");
+            boolean overwrite = cmd.hasOption("o");
+            boolean mergeSchema = cmd.hasOption("m");
             
             // Create temporary directory
             String tempDir = cmd.getOptionValue("tmp", 
-                    System.getProperty("java.io.tmpdir") + "/delta-export-" + UUID.randomUUID());
+                    System.getProperty("java.io.tmpdir") + "/delta-import-" + UUID.randomUUID());
             
             // Extract S3 configuration if needed
             String accessKey = cmd.getOptionValue("ak");
@@ -59,23 +60,23 @@ public class Main {
             String endpoint = cmd.getOptionValue("e");
             boolean pathStyleAccess = cmd.hasOption("psa");
             
-            // Create storage provider based on the table path
+            // Create storage provider based on the target path
             StorageProvider storageProvider;
-            if (tablePath.startsWith("s3://") || tablePath.startsWith("s3a://")) {
+            if (targetPath.startsWith("s3://") || targetPath.startsWith("s3a://")) {
                 LOG.info("Using S3 storage provider with provided credentials");
                 storageProvider = StorageProviderFactory.createProvider(
-                        tablePath, accessKey, secretKey, endpoint, pathStyleAccess);
+                        targetPath, accessKey, secretKey, endpoint, pathStyleAccess);
             } else {
                 LOG.info("Using local storage provider");
-                storageProvider = StorageProviderFactory.createProvider(tablePath);
+                storageProvider = StorageProviderFactory.createProvider(targetPath);
             }
             
-            // Create and run the exporter
-            DeltaTableExporter exporter = new DeltaTableExporter(
-                    tablePath, fromVersion, outputZipPath, tempDir, storageProvider);
+            // Create and run the importer
+            DeltaTableImporter importer = new DeltaTableImporter(
+                    zipFilePath, targetPath, tempDir, overwrite, mergeSchema, storageProvider);
             
-            LOG.info("Starting Delta Table export process");
-            String finalOutputPath = exporter.export();
+            LOG.info("Starting Delta Table import process");
+            importer.importTable();
             
             // Clean up temporary directory if requested
             if (cmd.hasOption("c")) {
@@ -91,14 +92,14 @@ public class Main {
                         });
             }
             
-            LOG.info("Delta Table export completed successfully. Final output path: {}", finalOutputPath);
+            LOG.info("Delta Table import completed successfully");
             
         } catch (ParseException e) {
             LOG.error("Error parsing command line arguments: {}", e.getMessage());
-            formatter.printHelp("delta-table-replicator", options);
+            formatter.printHelp("delta-table-importer", options);
             System.exit(1);
         } catch (Exception e) {
-            LOG.error("Error during Delta Table export", e);
+            LOG.error("Error during Delta Table import", e);
             System.exit(1);
         }
     }
@@ -112,25 +113,29 @@ public class Main {
         Options options = new Options();
         
         // Required options
-        options.addOption(Option.builder("s")
-                .longOpt("table-path")
-                .desc("Path to the Delta table (s3a://bucket/path/to/table or file:///path/to/table)")
+        options.addOption(Option.builder("z")
+                .longOpt("zip-file")
+                .desc("Path to the ZIP file containing the Delta table export")
                 .hasArg()
                 .required()
                 .build());
         
+        options.addOption(Option.builder("t")
+                .longOpt("target-path")
+                .desc("Path where the Delta table will be created (s3a://bucket/path/to/table or file:///path/to/table)")
+                .hasArg()
+                .required()
+                .build());
+        
+        // Import options
         options.addOption(Option.builder("o")
-                .longOpt("output-zip")
-                .desc("Local path where the ZIP file will be created")
-                .hasArg()
-                .required()
+                .longOpt("overwrite")
+                .desc("Overwrite the target table if it exists")
                 .build());
         
-        // Optional version range
-        options.addOption(Option.builder("f")
-                .longOpt("from-version")
-                .desc("Starting version to export (inclusive, default: 0)")
-                .hasArg()
+        options.addOption(Option.builder("m")
+                .longOpt("merge-schema")
+                .desc("Merge the schema with the existing table if it exists")
                 .build());
         
         // S3 configuration options
@@ -160,13 +165,13 @@ public class Main {
         // Other options
         options.addOption(Option.builder("tmp")
                 .longOpt("temp-dir")
-                .desc("Temporary directory to use for downloading files")
+                .desc("Temporary directory to use for extracting files")
                 .hasArg()
                 .build());
         
         options.addOption(Option.builder("c")
                 .longOpt("cleanup")
-                .desc("Clean up temporary directory after export")
+                .desc("Clean up temporary directory after import")
                 .build());
         
         options.addOption(Option.builder("h")
