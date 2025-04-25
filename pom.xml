@@ -9,11 +9,7 @@
     <version>1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <modules>
-        <module>common</module>
-        <module>exporter</module>
-        <module>sample-delta-writer</module>
-        <module>importer</module>
-        <module>integration-tests</module>
+        <module>replicator</module>
     </modules>
 
     <properties>
