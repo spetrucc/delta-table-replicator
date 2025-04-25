@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+        </Console>
+    </Appenders>
+    <Loggers>
+        <!-- Mute all external libraries -->
+        <Logger name="org" level="WARN" />
+        <Logger name="io" level="WARN" />
+
+        <!-- Mute Delta logs -->
+        <Logger name="io.delta" level="INFO" />
+        
+        <!-- Root logger -->
+        <Root level="DEBUG">
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>

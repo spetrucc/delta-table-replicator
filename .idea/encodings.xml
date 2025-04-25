@@ -9,6 +9,8 @@
     <file url="file://$PROJECT_DIR$/importer/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/integration-tests/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/integration-tests/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/replicator/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/replicator/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/sample-delta-writer/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/sample-delta-writer/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/src/main/java" charset="UTF-8" />
