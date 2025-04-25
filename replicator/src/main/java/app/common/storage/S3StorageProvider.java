@@ -32,16 +32,7 @@ public class S3StorageProvider implements StorageProvider {
     private final String bucket;
     private final String prefix;
     private final S3Client s3Client;
-    
-    /**
-     * Creates a new S3StorageProvider.
-     *
-     * @param basePath The S3 path in the format s3a://bucket/prefix or s3://bucket/prefix
-     */
-    public S3StorageProvider(String basePath) {
-        this(basePath, null, null, null, false);
-    }
-    
+
     /**
      * Creates a new S3StorageProvider.
      *
@@ -50,9 +41,21 @@ public class S3StorageProvider implements StorageProvider {
      * @param secretKey The AWS secret key
      * @param endpoint The S3 endpoint (optional, for S3-compatible storage)
      * @param pathStyleAccess Whether to use path-style access (for S3-compatible storage)
+     * @deprecated Use {@link #S3StorageProvider(String, S3Settings)} instead
      */
+    @Deprecated
     public S3StorageProvider(String basePath, String accessKey, String secretKey, 
                             String endpoint, boolean pathStyleAccess) {
+        this(basePath, new S3Settings(accessKey, secretKey, endpoint, pathStyleAccess));
+    }
+    
+    /**
+     * Creates a new S3StorageProvider.
+     *
+     * @param basePath The S3 path in the format s3a://bucket/prefix or s3://bucket/prefix
+     * @param s3Settings The S3 connection settings
+     */
+    public S3StorageProvider(String basePath, S3Settings s3Settings) {
         this.basePath = basePath;
         
         // Parse bucket and prefix from the basePath
@@ -71,18 +74,19 @@ public class S3StorageProvider implements StorageProvider {
                 .region(Region.US_EAST_1); // Default region, can be overridden
         
         // Configure credentials if provided
-        if (accessKey != null && secretKey != null) {
-            AwsBasicCredentials credentials = AwsBasicCredentials.create(accessKey, secretKey);
+        if (s3Settings.hasCredentials()) {
+            AwsBasicCredentials credentials = AwsBasicCredentials.create(
+                    s3Settings.accessKey(), s3Settings.secretKey());
             builder.credentialsProvider(StaticCredentialsProvider.create(credentials));
         }
         
         // Configure endpoint if provided (for S3-compatible storage)
-        if (endpoint != null && !endpoint.isEmpty()) {
-            builder.endpointOverride(URI.create(endpoint));
+        if (s3Settings.hasCustomEndpoint()) {
+            builder.endpointOverride(URI.create(s3Settings.endpoint()));
         }
         
         // Configure path-style access if requested
-        if (pathStyleAccess) {
+        if (s3Settings.pathStyleAccessEnabled()) {
             builder.serviceConfiguration(s3 -> s3.pathStyleAccessEnabled(true));
         }
         

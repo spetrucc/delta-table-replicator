@@ -1,5 +1,6 @@
 package app;
 
+import app.common.storage.S3Settings;
 import app.common.storage.StorageProvider;
 import app.common.storage.StorageProviderFactory;
 import app.exporter.DeltaTableExporter;
@@ -54,17 +55,18 @@ public class ExporterMain {
                     System.getProperty("java.io.tmpdir") + "/delta-export-" + UUID.randomUUID());
             
             // Extract S3 configuration if needed
-            String accessKey = cmd.getOptionValue("ak");
-            String secretKey = cmd.getOptionValue("sk");
-            String endpoint = cmd.getOptionValue("e");
-            boolean pathStyleAccess = cmd.hasOption("psa");
+            S3Settings s3Settings = new S3Settings(
+                cmd.getOptionValue("s3-access-key"),
+                cmd.getOptionValue("s3-secret-key"),
+                cmd.getOptionValue("s3-endpoint"),
+                cmd.hasOption("s3-path-style-access")
+            );
             
             // Create storage provider based on the table path
             StorageProvider storageProvider;
             if (tablePath.startsWith("s3://") || tablePath.startsWith("s3a://")) {
                 LOG.info("Using S3 storage provider with provided credentials");
-                storageProvider = StorageProviderFactory.createProvider(
-                        tablePath, accessKey, secretKey, endpoint, pathStyleAccess);
+                storageProvider = StorageProviderFactory.createProvider(tablePath, s3Settings);
             } else {
                 LOG.info("Using local storage provider");
                 storageProvider = StorageProviderFactory.createProvider(tablePath);
@@ -134,26 +136,26 @@ public class ExporterMain {
                 .build());
         
         // S3 configuration options
-        options.addOption(Option.builder("ak")
-                .longOpt("access-key")
+        options.addOption(Option.builder("s3-access-key")
+                .longOpt("s3-access-key")
                 .desc("AWS access key (only needed for S3 paths)")
                 .hasArg()
                 .build());
         
-        options.addOption(Option.builder("sk")
-                .longOpt("secret-key")
+        options.addOption(Option.builder("s3-secret-key")
+                .longOpt("s3-secret-key")
                 .desc("AWS secret key (only needed for S3 paths)")
                 .hasArg()
                 .build());
         
-        options.addOption(Option.builder("e")
-                .longOpt("endpoint")
+        options.addOption(Option.builder("s3-endpoint")
+                .longOpt("s3-endpoint")
                 .desc("S3 endpoint (for S3-compatible storage, only needed for S3 paths)")
                 .hasArg()
                 .build());
         
-        options.addOption(Option.builder("psa")
-                .longOpt("path-style-access")
+        options.addOption(Option.builder("s3-path-style-access")
+                .longOpt("s3-path-style-access")
                 .desc("Use path-style access (for S3-compatible storage, only needed for S3 paths)")
                 .build());
         
