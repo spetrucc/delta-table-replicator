@@ -1,8 +1,8 @@
 package app;
 
-import app.exporter.DeltaTableExporter;
 import app.common.storage.StorageProvider;
 import app.common.storage.StorageProviderFactory;
+import app.exporter.DeltaTableExporter;
 import org.apache.commons.cli.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,14 +49,6 @@ public class ExporterMain {
             String outputZipPath = cmd.getOptionValue("o");
             long fromVersion = Long.parseLong(cmd.getOptionValue("f", "0"));
             
-            // Parse max ZIP size if provided
-            long maxZipSize = 2L * 1024 * 1024 * 1024; // Default 2GB
-            if (cmd.hasOption("m")) {
-                String maxZipSizeStr = cmd.getOptionValue("m");
-                maxZipSize = parseSize(maxZipSizeStr);
-                LOG.info("Using maximum ZIP volume size: {} bytes", maxZipSize);
-            }
-            
             // Create temporary directory
             String tempDir = cmd.getOptionValue("tmp", 
                     System.getProperty("java.io.tmpdir") + "/delta-export-" + UUID.randomUUID());
@@ -80,7 +72,7 @@ public class ExporterMain {
             
             // Create and run the exporter
             DeltaTableExporter exporter = new DeltaTableExporter(
-                    tablePath, fromVersion, outputZipPath, tempDir, storageProvider, maxZipSize);
+                    tablePath, fromVersion, outputZipPath, tempDir, storageProvider);
             
             LOG.info("Starting Delta Table export process");
             String finalOutputPath = exporter.export();
@@ -141,14 +133,6 @@ public class ExporterMain {
                 .hasArg()
                 .build());
         
-        // ZIP file options
-        options.addOption(Option.builder("m")
-                .longOpt("max-zip-size")
-                .desc("Maximum size of each ZIP volume in bytes (default: 2GB). " +
-                      "Use suffixes K, M, or G for kilobytes, megabytes, or gigabytes.")
-                .hasArg()
-                .build());
-        
         // S3 configuration options
         options.addOption(Option.builder("ak")
                 .longOpt("access-key")
@@ -191,34 +175,5 @@ public class ExporterMain {
                 .build());
         
         return options;
-    }
-
-    /**
-     * Parses a size string like "1G" or "500M" into bytes.
-     *
-     * @param sizeStr The size string to parse (e.g. "1G", "500M", "1024K", "1048576")
-     * @return The size in bytes
-     */
-    private static long parseSize(String sizeStr) {
-        sizeStr = sizeStr.trim().toUpperCase();
-        long multiplier = 1;
-        
-        if (sizeStr.endsWith("K")) {
-            multiplier = 1024L;
-            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
-        } else if (sizeStr.endsWith("M")) {
-            multiplier = 1024L * 1024L;
-            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
-        } else if (sizeStr.endsWith("G")) {
-            multiplier = 1024L * 1024L * 1024L;
-            sizeStr = sizeStr.substring(0, sizeStr.length() - 1);
-        }
-        
-        try {
-            return Long.parseLong(sizeStr) * multiplier;
-        } catch (NumberFormatException e) {
-            LOG.warn("Invalid size format: {}. Using default size.", sizeStr);
-            return 2L * 1024L * 1024L * 1024L; // Default to 2GB
-        }
     }
 }

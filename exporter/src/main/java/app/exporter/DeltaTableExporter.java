@@ -5,8 +5,6 @@ import app.common.model.ExportMetadata;
 import app.common.storage.StorageProvider;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
-import org.apache.commons.compress.archivers.sevenz.SevenZOutputFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,10 +16,12 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
- * Exports Delta Lake tables from S3 or local filesystem to a local 7-Zip archive.
- * The 7-Zip archive contains all necessary files to replicate the table between two Delta versions.
+ * Exports Delta Lake tables from S3 or local filesystem to a local ZIP archive.
+ * The ZIP archive contains all necessary files to replicate the table between two Delta versions.
  */
 public class DeltaTableExporter {
     private static final Logger LOG = LoggerFactory.getLogger(DeltaTableExporter.class);
@@ -36,36 +36,19 @@ public class DeltaTableExporter {
     private final Set<String> processedFiles;
     private final StorageProvider storageProvider;
     private long actualEndVersion;
-    private long maxVolumeBytes;
 
     /**
      * Creates a new DeltaTableExporter.
      *
      * @param tablePath     The path to the Delta table (s3a://bucket/path/to/table or file:///path/to/table)
      * @param fromVersion   The starting version to export (inclusive)
-     * @param outputArchivePath The local path where the 7-Zip archive will be created
+     * @param outputArchivePath The local path where the ZIP archive will be created
      * @param tempDir       The temporary directory to use for downloading files
      * @param storageProvider The storage provider to use for file operations
      */
     public DeltaTableExporter(String tablePath, long fromVersion,
                              String outputArchivePath, String tempDir,
                              StorageProvider storageProvider) {
-        this(tablePath, fromVersion, outputArchivePath, tempDir, storageProvider, 2L * 1024 * 1024 * 1024); // Default 2GB
-    }
-
-    /**
-     * Creates a new DeltaTableExporter with a specified maximum volume size.
-     *
-     * @param tablePath     The path to the Delta table (s3a://bucket/path/to/table or file:///path/to/table)
-     * @param fromVersion   The starting version to export (inclusive)
-     * @param outputArchivePath The local path where the 7-Zip archive will be created
-     * @param tempDir       The temporary directory to use for downloading files
-     * @param storageProvider The storage provider to use for file operations
-     * @param maxVolumeBytes The maximum size for each 7-Zip volume in bytes
-     */
-    public DeltaTableExporter(String tablePath, long fromVersion,
-                             String outputArchivePath, String tempDir,
-                             StorageProvider storageProvider, long maxVolumeBytes) {
         this.tablePath = tablePath;
         this.fromVersion = fromVersion;
         this.outputArchivePath = outputArchivePath;
@@ -74,33 +57,13 @@ public class DeltaTableExporter {
         this.processedFiles = new HashSet<>();
         this.storageProvider = storageProvider;
         this.actualEndVersion = -1;
-        this.maxVolumeBytes = maxVolumeBytes > 0 ? maxVolumeBytes : 2L * 1024 * 1024 * 1024; // Ensure positive value
     }
 
     /**
-     * Sets the maximum size for each 7-Zip volume in bytes.
-     * If a 7-Zip archive would exceed this size, it will be split into multiple volumes.
-     * 
-     * @param maxVolumeBytes Maximum size in bytes for each 7-Zip volume
-     */
-    public void setMaxVolumeBytes(long maxVolumeBytes) {
-        this.maxVolumeBytes = maxVolumeBytes > 0 ? maxVolumeBytes : 2L * 1024 * 1024 * 1024;
-    }
-
-    /**
-     * Gets the maximum size for each 7-Zip volume in bytes.
-     * 
-     * @return Maximum size in bytes for each 7-Zip volume
-     */
-    public long getMaxVolumeBytes() {
-        return maxVolumeBytes;
-    }
-
-    /**
-     * Exports the Delta table to a 7-Zip archive.
+     * Exports the Delta table to a ZIP archive.
      * 
      * @throws IOException If an I/O error occurs
-     * @return The path to the created 7-Zip archive, which may include version information
+     * @return The path to the created ZIP archive
      */
     public String export() throws IOException {
         // Find the latest available version in the Delta table
@@ -108,7 +71,10 @@ public class DeltaTableExporter {
         if (latestVersion < 0) {
             throw new IOException("No versions found in the Delta table");
         }
-        
+
+        // TODO: Handle case where fromVersion > latestVersion
+        // TODO: Ensure that we have all commit since 0 OR at least 1 checkpoint
+
         // Use the latest available version as the end version
         actualEndVersion = latestVersion;
         LOG.info("Exporting Delta table from version {} to {} (latest)", fromVersion, actualEndVersion);
@@ -128,8 +94,8 @@ public class DeltaTableExporter {
         // Generate metadata.json file
         generateMetadataFile();
         
-        // Create the 7-Zip archive from the downloaded files
-        return create7ZipArchive();
+        // Create the ZIP archive from the downloaded files
+        return createZipArchive();
     }
 
     /**
@@ -358,6 +324,8 @@ public class DeltaTableExporter {
      * @throws IOException If an I/O error occurs
      */
     private void downloadDeletionVectorFile(String dvFilePath) throws IOException {
+
+        // TODO: Extend the use of processedFiles to also cover data files; data files might be repeated across versions
         // Skip if already processed
         if (processedFiles.contains(dvFilePath)) {
             LOG.info("Deletion vector file already processed: {}", dvFilePath);
@@ -432,150 +400,73 @@ public class DeltaTableExporter {
     }
 
     /**
-     * Creates the final 7-Zip archive from the downloaded files.
-     * If the files exceed the maximum volume size, multiple volumes will be created.
+     * Creates the final ZIP archive from the downloaded files using Java's native ZIP implementation.
      *
      * @throws IOException If an I/O error occurs
-     * @return The path to the created 7-Zip archive (or path pattern for multi-volume archives)
+     * @return The path to the created ZIP archive
      */
-    private String create7ZipArchive() throws IOException {
-        // Ensure the output path has a .7z extension
-        String baseOutputPath = outputArchivePath;
-        if (!baseOutputPath.toLowerCase().endsWith(".7z")) {
-            baseOutputPath += ".7z";
+    private String createZipArchive() throws IOException {
+        // Ensure the output path has a .zip extension
+        String outputPath = outputArchivePath;
+        if (!outputPath.toLowerCase().endsWith(".zip")) {
+            outputPath += ".zip";
         }
         
-        LOG.info("Creating 7-Zip archive: {}", baseOutputPath);
-        
-        // Collect all files to be archived
+        LOG.info("Creating ZIP archive: {}", outputPath);
+
+        // TODO: Handle temp directory differently; create TEMP sub-folder and clean content after ZIP creation
+        // Check for empty temp directory
         Path tempPath = Paths.get(tempDir);
-        List<Path> allFiles = Files.walk(tempPath)
-            .filter(path -> !Files.isDirectory(path))
-            .toList();
+        if (!Files.exists(tempPath) || Files.list(tempPath).findAny().isEmpty()) {
+            LOG.warn("No files found to add to ZIP archive");
+            return outputPath; // Return the output path even though no archive will be created
+        }
         
-        if (allFiles.isEmpty()) {
-            LOG.warn("No files found to add to 7-Zip archive");
-            // Create an empty archive
-            try (SevenZOutputFile sevenZOutput = new SevenZOutputFile(new File(baseOutputPath))) {
-                // Empty archive created
+        // Debug: Log all files to be archived
+        LOG.info("Files to be archived:");
+        Files.walk(tempPath).filter(Files::isRegularFile).forEach(file -> {
+            try {
+                LOG.info("  - {}: {} bytes", tempPath.relativize(file), Files.size(file));
+            } catch (IOException e) {
+                LOG.warn("Error getting file size: {}", file);
             }
-            return baseOutputPath;
-        }
+        });
         
-        // Estimate if we need multiple volumes
-        long totalSize = 0;
-        for (Path path : allFiles) {
-            totalSize += Files.size(path);
-        }
-        
-        LOG.info("Total size of files to archive: {} bytes", totalSize);
-        
-        // If the total size is small enough for a single file
-        if (totalSize < maxVolumeBytes) {
-            LOG.info("Creating single 7-Zip archive");
-            createSingle7ZipArchive(baseOutputPath, tempPath, allFiles);
-            return baseOutputPath;
-        } else {
-            LOG.info("Creating multi-volume 7-Zip archive with max volume size: {} bytes", maxVolumeBytes);
-            return createMultiVolume7ZipArchive(baseOutputPath, tempPath, allFiles);
-        }
-    }
-    
-    /**
-     * Creates a single 7-Zip archive containing all files.
-     *
-     * @param outputPath The output path for the 7-Zip archive
-     * @param basePath The base path for calculating relative paths
-     * @param files The list of files to include
-     * @throws IOException If an I/O error occurs
-     */
-    private void createSingle7ZipArchive(String outputPath, Path basePath, List<Path> files) throws IOException {
-        try (SevenZOutputFile sevenZOutput = new SevenZOutputFile(new File(outputPath))) {
-            for (Path path : files) {
-                String relativePath = basePath.relativize(path).toString();
-                SevenZArchiveEntry entry = new SevenZArchiveEntry();
-                entry.setName(relativePath);
-                entry.setSize(Files.size(path));
-                sevenZOutput.putArchiveEntry(entry);
-                
-                // Use InputStream for copying
-                try (InputStream inputStream = Files.newInputStream(path)) {
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = inputStream.read(buffer)) != -1) {
-                        sevenZOutput.write(buffer, 0, bytesRead);
+        try (FileOutputStream fos = new FileOutputStream(outputPath);
+             ZipOutputStream zos = new ZipOutputStream(fos)) {
+            
+            Files.walk(tempPath)
+                .filter(Files::isRegularFile)
+                .forEach(file -> {
+                    try {
+                        String relativePath = tempPath.relativize(file).toString();
+                        ZipEntry zipEntry = new ZipEntry(relativePath);
+                        zos.putNextEntry(zipEntry);
+                        
+                        Files.copy(file, zos);
+                        zos.closeEntry();
+                        
+                        LOG.debug("Added to archive: {}", relativePath);
+                    } catch (IOException e) {
+                        LOG.error("Error adding file to ZIP: {}", file, e);
+                        throw new UncheckedIOException(e);
                     }
-                }
-                
-                sevenZOutput.closeArchiveEntry();
-            }
-        }
-    }
-    
-    /**
-     * Creates a multi-volume 7-Zip archive with files distributed across volumes.
-     *
-     * @param baseOutputPath The base output path for the 7-Zip volumes
-     * @param basePath The base path for calculating relative paths
-     * @param files The list of files to include
-     * @throws IOException If an I/O error occurs
-     * @return Pattern for the created volumes
-     */
-    private String createMultiVolume7ZipArchive(String baseOutputPath, Path basePath, List<Path> files) throws IOException {
-        // Split the files into volumes
-        int volumeNumber = 1;
-        int totalVolumes = 0;
-        long currentVolumeSize = 0;
-        List<Path> currentVolumeFiles = new ArrayList<>();
-        
-        // Get the base name without extension for volume naming
-        String baseNameWithoutExt = baseOutputPath;
-        if (baseNameWithoutExt.toLowerCase().endsWith(".7z")) {
-            baseNameWithoutExt = baseNameWithoutExt.substring(0, baseNameWithoutExt.length() - 3);
-        }
-        
-        // Process all files, distributing them across volumes
-        for (Path path : files) {
-            long fileSize = Files.size(path);
+                });
             
-            // If this file would make the current volume too big, create the current volume
-            if (currentVolumeSize + fileSize > maxVolumeBytes && !currentVolumeFiles.isEmpty()) {
-                // Create a volume with the current batch of files
-                String volumePath = String.format("%s.vol%03d.7z", baseNameWithoutExt, volumeNumber);
-                createSingle7ZipArchive(volumePath, basePath, currentVolumeFiles);
-                
-                LOG.info("Created volume {} with {} files, {} bytes", 
-                        volumeNumber, currentVolumeFiles.size(), currentVolumeSize);
-                
-                // Reset for next volume
-                volumeNumber++;
-                currentVolumeFiles = new ArrayList<>();
-                currentVolumeSize = 0;
-                totalVolumes++;
-            }
-            
-            // Add the current file to the batch
-            currentVolumeFiles.add(path);
-            currentVolumeSize += fileSize;
+            LOG.info("ZIP archive created successfully");
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
         }
         
-        // Create final volume with remaining files
-        if (!currentVolumeFiles.isEmpty()) {
-            String volumePath = String.format("%s.vol%03d.7z", baseNameWithoutExt, volumeNumber);
-            createSingle7ZipArchive(volumePath, basePath, currentVolumeFiles);
-            
-            LOG.info("Created final volume {} with {} files, {} bytes", 
-                    volumeNumber, currentVolumeFiles.size(), currentVolumeSize);
-            totalVolumes++;
-        }
-        
-        LOG.info("Created {} volumes for the 7-Zip archive", totalVolumes);
-        
-        // Return pattern for multi-volume files
-        if (totalVolumes == 1) {
-            return String.format("%s.vol001.7z", baseNameWithoutExt);
+        // Debug: List the created archive
+        File outputFile = new File(outputPath);
+        if (outputFile.exists()) {
+            LOG.info("ZIP archive created: {}: {} bytes", outputPath, outputFile.length());
         } else {
-            return baseNameWithoutExt + ".vol*.7z";
+            LOG.error("ZIP archive creation failed: file does not exist");
+            throw new IOException("ZIP archive creation failed: file does not exist");
         }
+        
+        return outputPath;
     }
 }

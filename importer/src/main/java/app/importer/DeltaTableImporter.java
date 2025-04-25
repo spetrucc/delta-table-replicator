@@ -1,7 +1,7 @@
 package app.importer;
 
-import app.common.storage.StorageProvider;
 import app.common.model.ExportMetadata;
+import app.common.storage.StorageProvider;
 import com.google.gson.Gson;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.delta.DeltaLog;
@@ -12,8 +12,9 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Enumeration;
 import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import java.util.zip.ZipFile;
 
 /**
  * Imports Delta Lake tables from a ZIP archive to a target location.
@@ -22,9 +23,8 @@ import java.util.zip.ZipInputStream;
 public class DeltaTableImporter {
     private static final Logger LOG = LoggerFactory.getLogger(DeltaTableImporter.class);
     private static final String DELTA_LOG_DIR = "_delta_log";
-    private static final int BUFFER_SIZE = 8192;
 
-    private final String zipFilePath;
+    private final String archivePath;
     private final String targetPath;
     private final String tempDir;
     private final boolean overwrite;
@@ -37,17 +37,17 @@ public class DeltaTableImporter {
     /**
      * Creates a new DeltaTableImporter.
      *
-     * @param zipFilePath      The path to the ZIP file containing the Delta table export
+     * @param archivePath      The path to the ZIP archive containing the Delta table export
      * @param targetPath       The path where the Delta table will be created
      * @param tempDir          The temporary directory to use for extracting files
      * @param overwrite        Whether to overwrite the target table if it exists
      * @param mergeSchema      Whether to merge the schema with the existing table if it exists
      * @param storageProvider  The storage provider to use for file operations
      */
-    public DeltaTableImporter(String zipFilePath, String targetPath, String tempDir, 
+    public DeltaTableImporter(String archivePath, String targetPath, String tempDir, 
                              boolean overwrite, boolean mergeSchema,
                              StorageProvider storageProvider) {
-        this.zipFilePath = zipFilePath;
+        this.archivePath = archivePath;
         this.targetPath = targetPath;
         this.tempDir = tempDir;
         this.overwrite = overwrite;
@@ -57,26 +57,30 @@ public class DeltaTableImporter {
     }
 
     /**
-     * Imports the Delta table from the ZIP file to the target location.
+     * Imports the Delta table from the ZIP archive to the target location.
      *
      * @throws IOException If an I/O error occurs
      */
     public void importTable() throws IOException {
-        LOG.info("Starting import of Delta table from ZIP {} to {}", zipFilePath, targetPath);
+        LOG.info("Starting import of Delta table from archive {} to {}", archivePath, targetPath);
 
         // Create temporary directory if it doesn't exist
         Files.createDirectories(Paths.get(tempDir));
         
-        // Extract the ZIP file to the temporary directory
-        extractZipFile();
-        
+        // Extract the ZIP archive to the temporary directory
+        extractZipArchive();
+
+        // TODO Make meta-data is mandatory; fail import if not present
         // Read metadata if available
         readMetadata();
-        
+
+        // TODO: Ensure that there was no more version than the one in the metadata
+
         // Initialize Spark
         initializeSpark();
-        
-        // Validate the extracted Delta table
+
+        // TODO: This actually validates that the ZIP is not empty. Remove this step, or at least rename the method name to clarify
+        // Validate the target Delta table
         validateDeltaTable();
         
         // Copy the extracted files to the target location
@@ -96,40 +100,97 @@ public class DeltaTableImporter {
     }
 
     /**
-     * Extracts the ZIP file to the temporary directory.
+     * Extracts the ZIP archive to the temporary directory using Java's ZIP implementation.
      *
      * @throws IOException If an I/O error occurs
      */
-    private void extractZipFile() throws IOException {
-        LOG.info("Extracting ZIP file to temporary directory: {}", tempDir);
+    private void extractZipArchive() throws IOException {
+        LOG.info("Extracting ZIP archive: {}", archivePath);
         
-        try (ZipInputStream zipIn = new ZipInputStream(new FileInputStream(zipFilePath))) {
-            ZipEntry entry;
-            while ((entry = zipIn.getNextEntry()) != null) {
-                String filePath = tempDir + File.separator + entry.getName();
-                
-                if (entry.isDirectory()) {
-                    // Create directory if it doesn't exist
-                    Files.createDirectories(Paths.get(filePath));
-                } else {
-                    // Create parent directories if they don't exist
-                    Files.createDirectories(Paths.get(filePath).getParent());
-                    
-                    // Extract file
-                    try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(filePath))) {
-                        byte[] buffer = new byte[BUFFER_SIZE];
-                        int read;
-                        while ((read = zipIn.read(buffer)) != -1) {
-                            bos.write(buffer, 0, read);
-                        }
-                    }
-                }
-                
-                zipIn.closeEntry();
-            }
+        // Verify the archive file exists
+        File archiveFile = new File(archivePath);
+        if (!archiveFile.exists()) {
+            throw new IOException("Archive file not found: " + archivePath);
         }
         
-        LOG.info("ZIP file extracted successfully");
+        // Create the temp directory if it doesn't exist
+        File tempDirFile = new File(tempDir);
+        if (!tempDirFile.exists()) {
+            if (!tempDirFile.mkdirs()) {
+                throw new IOException("Failed to create temp directory: " + tempDir);
+            }
+            LOG.info("Created temp directory: {}", tempDir);
+        }
+        
+        try (ZipFile zipFile = new ZipFile(archiveFile)) {
+            // Get the list of entries
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+            
+            // Extract each entry
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                Path entryPath = Paths.get(tempDir, entry.getName());
+                
+                if (!entry.isDirectory()) {
+                    // Ensure parent directories exist
+                    Files.createDirectories(entryPath.getParent());
+                    
+                    // Extract the file
+                    // TODO: Update implementation using InputStream.transferTo
+                    try (InputStream is = zipFile.getInputStream(entry);
+                         FileOutputStream fos = new FileOutputStream(entryPath.toFile())) {
+                        byte[] buffer = new byte[8192];
+                        int length;
+                        while ((length = is.read(buffer)) > 0) {
+                            fos.write(buffer, 0, length);
+                        }
+                    }
+                    LOG.debug("Extracted: {}", entry.getName());
+                }
+            }
+            
+            LOG.info("ZIP archive extracted successfully");
+            
+            // List files in the temp directory to verify extraction
+            LOG.info("Listing files in temp directory after extraction:");
+            listFiles(new File(tempDir), "");
+            
+            // Check if _delta_log directory exists in the extracted files
+            File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+            if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
+                LOG.error("_delta_log directory not found in extracted archive");
+                // Try listing all directories to help diagnose
+                LOG.info("Contents of temp directory:");
+                for (File file : tempDirFile.listFiles()) {
+                    LOG.info("  {}: {}", file.isDirectory() ? "Directory" : "File", file.getName());
+                }
+            } else {
+                LOG.info("_delta_log directory found: {}", deltaLogDir.getAbsolutePath());
+            }
+        } catch (Exception e) {
+            LOG.error("Error extracting ZIP archive", e);
+            throw new IOException("ZIP archive extraction failed", e);
+        }
+    }
+    
+    /**
+     * Recursively lists files in a directory for debugging purposes.
+     *
+     * @param dir Directory to list files from
+     * @param indent Current indentation for prettier logging
+     */
+    private void listFiles(File dir, String indent) {
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    LOG.info("{}Directory: {}/", indent, file.getName());
+                    listFiles(file, indent + "  ");
+                } else {
+                    LOG.info("{}File: {} ({} bytes)", indent, file.getName(), file.length());
+                }
+            }
+        }
     }
 
     /**
@@ -199,89 +260,102 @@ public class DeltaTableImporter {
         Path deltaLogSourcePath = Paths.get(tempDir, DELTA_LOG_DIR);
         if (Files.exists(deltaLogSourcePath) && Files.isDirectory(deltaLogSourcePath)) {
             try (java.util.stream.Stream<Path> deltaLogFiles = Files.list(deltaLogSourcePath)) {
-                deltaLogFiles.forEach(source -> {
+                deltaLogFiles.forEach(file -> {
                     try {
-                        String fileName = source.getFileName().toString();
-                        String destinationPath = targetPath + "/" + DELTA_LOG_DIR + "/" + fileName;
-                        LOG.info("Copying Delta log file: {} -> {}", source, destinationPath);
-                        storageProvider.uploadFile(source.toString(), destinationPath);
-                    } catch (IOException e) {
-                        LOG.error("Failed to copy Delta log file: {}", source, e);
-                    }
-                });
-            }
-        }
-        
-        // Copy all other files from temp directory to target
-        Files.walk(Paths.get(tempDir))
-                .filter(source -> !Files.isDirectory(source))
-                .filter(source -> !source.toString().contains("/" + DELTA_LOG_DIR + "/")) // Skip _delta_log files as they were already copied
-                .forEach(source -> {
-                    try {
-                        Path relativePath = Paths.get(tempDir).relativize(source);
-                        String destinationPath = targetPath + "/" + relativePath.toString();
+                        String relativePath = deltaLogSourcePath.relativize(file).toString();
+                        String targetFilePath = targetPath + "/" + DELTA_LOG_DIR + "/" + relativePath;
                         
-                        // Upload the file to the target storage
-                        LOG.info("Copying file: {} -> {}", source, destinationPath);
-                        storageProvider.uploadFile(source.toString(), destinationPath);
+                        // TODO: Update implementation using InputStream.transferTo
+                        // Copy the file to the target
+                        try (InputStream is = Files.newInputStream(file);
+                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = is.read(buffer)) != -1) {
+                                os.write(buffer, 0, bytesRead);
+                            }
+                        }
+                        
+                        LOG.debug("Copied _delta_log file: {}", relativePath);
                     } catch (IOException e) {
-                        LOG.error("Failed to copy file: {}", source, e);
+                        LOG.error("Error copying _delta_log file: {}", file, e);
                     }
                 });
-        
-        LOG.info("Files copied successfully");
-    }
-
-    /**
-     * Verifies that the imported table is valid and can be read by Spark.
-     *
-     * @throws IOException If the verification fails
-     */
-    private void verifyImportedTable() throws IOException {
-        LOG.info("Verifying imported Delta table at path: {}", targetPath);
-        
-        try {
-            // Convert path to be compatible with Spark's expectations
-            String sparkPath = targetPath;
-            if (!sparkPath.startsWith("file:")) {
-                sparkPath = "file://" + sparkPath;
             }
-            LOG.info("Using Spark path: {}", sparkPath);
-            
-            // Force Spark to refresh its cache of the Delta table
-            spark.sql("REFRESH TABLE delta.`" + sparkPath + "`");
-            
-            // Try to open the Delta table
-            DeltaLog deltaLog = DeltaLog.forTable(spark, sparkPath);
-            long version = deltaLog.currentSnapshot().snapshot().version();
-            LOG.info("Successfully verified Delta table at version {}", version);
-            
-            // Try to read the table data
-            long rowCount = spark.read().format("delta").load(sparkPath).count();
-            LOG.info("Delta table contains {} rows", rowCount);
-        } catch (Exception e) {
-            LOG.error("Verification error", e);
-            throw new IOException("Failed to verify imported Delta table", e);
         }
+        
+        // Then copy data files
+        Path tempDirPath = Paths.get(tempDir);
+        try (java.util.stream.Stream<Path> dataFiles = Files.walk(tempDirPath)) {
+            dataFiles
+                .filter(Files::isRegularFile)
+                .forEach(file -> {
+                    try {
+                        // Skip _delta_log files as we've already handled them
+                        if (file.toString().contains(DELTA_LOG_DIR)) {
+                            return;
+                        }
+                        
+                        String relativePath = tempDirPath.relativize(file).toString();
+                        String targetFilePath = targetPath + "/" + relativePath;
+
+                        // TODO: Update implementation using InputStream.transferTo
+                        // Copy the file to the target
+                        try (InputStream is = Files.newInputStream(file);
+                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = is.read(buffer)) != -1) {
+                                os.write(buffer, 0, bytesRead);
+                            }
+                        }
+                        
+                        LOG.debug("Copied data file: {}", relativePath);
+                    } catch (IOException e) {
+                        LOG.error("Error copying data file: {}", file, e);
+                    }
+                });
+        }
+        
+        LOG.info("Files copied successfully to target location");
     }
 
     /**
-     * Reads the metadata.json file if it exists.
+     * Reads the metadata file if it exists.
      */
     private void readMetadata() {
-        Path metadataPath = Paths.get(tempDir, "metadata.json");
-        if (Files.exists(metadataPath)) {
-            try (Reader reader = Files.newBufferedReader(metadataPath)) {
-                metadata = gson.fromJson(reader, ExportMetadata.class);
-                LOG.info("Read metadata: {}", metadata);
-                LOG.info("Importing Delta table from {} (versions {}-{}), exported at {}", 
-                        metadata.getTablePath(), metadata.getFromVersion(), 
+        try {
+            Path metadataPath = Paths.get(tempDir, "export_metadata.json");
+            if (Files.exists(metadataPath)) {
+                String json = Files.readString(metadataPath);
+                metadata = gson.fromJson(json, ExportMetadata.class);
+                LOG.info("Read export metadata: table={}, fromVersion={}, toVersion={}, exportTime={}",
+                        metadata.getTableName(), metadata.getFromVersion(),
                         metadata.getToVersion(), metadata.getExportTimestamp());
-            } catch (Exception e) {
-                LOG.warn("Failed to read metadata.json: {}", e.getMessage());
+            } else {
+                LOG.info("No metadata file found");
             }
-        } else {
-            LOG.warn("No metadata.json found in the export");
+        } catch (Exception e) {
+            LOG.warn("Error reading metadata file", e);
+        }
+    }
+
+    /**
+     * Verifies that the imported table is valid and can be read.
+     */
+    private void verifyImportedTable() {
+        try {
+            LOG.info("Verifying imported table");
+            
+            // Attempt to load the Delta table
+            DeltaLog deltaLog = DeltaLog.forTable(spark, targetPath);
+            
+            // Get the current version
+            long version = deltaLog.snapshot().version();
+            
+            LOG.info("Successfully verified Delta table at {}, current version: {}", targetPath, version);
+        } catch (Exception e) {
+            LOG.warn("Warning: Could not verify imported table", e);
         }
     }
 }

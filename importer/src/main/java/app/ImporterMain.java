@@ -1,8 +1,8 @@
 package app;
 
-import app.importer.DeltaTableImporter;
 import app.common.storage.StorageProvider;
 import app.common.storage.StorageProviderFactory;
+import app.importer.DeltaTableImporter;
 import org.apache.commons.cli.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +14,7 @@ import java.util.UUID;
 
 /**
  * Main entry point for the Delta Table Importer application.
- * This application imports Delta Lake tables from a ZIP archive to a target location.
+ * This application imports Delta Lake tables from a 7-Zip archive to a target location.
  */
 public class ImporterMain {
     private static final Logger LOG = LoggerFactory.getLogger(ImporterMain.class);
@@ -36,8 +36,8 @@ public class ImporterMain {
             }
 
             // Validate required options
-            if (!cmd.hasOption("z")) {
-                throw new ParseException("Missing required option: zip-file");
+            if (!cmd.hasOption("a")) {
+                throw new ParseException("Missing required option: archive-file");
             }
 
             if (!cmd.hasOption("t")) {
@@ -45,7 +45,7 @@ public class ImporterMain {
             }
 
             // Extract command line parameters
-            String zipFilePath = cmd.getOptionValue("z");
+            String archivePath = cmd.getOptionValue("a");
             String targetPath = cmd.getOptionValue("t");
             boolean overwrite = cmd.hasOption("o");
             boolean mergeSchema = cmd.hasOption("m");
@@ -73,7 +73,7 @@ public class ImporterMain {
             
             // Create and run the importer
             DeltaTableImporter importer = new DeltaTableImporter(
-                    zipFilePath, targetPath, tempDir, overwrite, mergeSchema, storageProvider);
+                    archivePath, targetPath, tempDir, overwrite, mergeSchema, storageProvider);
             
             LOG.info("Starting Delta Table import process");
             importer.importTable();
@@ -113,9 +113,9 @@ public class ImporterMain {
         Options options = new Options();
         
         // Required options
-        options.addOption(Option.builder("z")
-                .longOpt("zip-file")
-                .desc("Path to the ZIP file containing the Delta table export")
+        options.addOption(Option.builder("a")
+                .longOpt("archive-file")
+                .desc("Path to the 7-Zip archive containing the Delta table export")
                 .hasArg()
                 .required()
                 .build());
