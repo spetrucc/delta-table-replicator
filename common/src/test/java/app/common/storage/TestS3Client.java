@@ -87,7 +87,7 @@ public class TestS3Client implements S3Client {
         }
         
         return ListObjectsV2Response.builder()
-                .contents(contents)
+                .contents(contents.isEmpty() ? null : contents)
                 .build();
     }
     

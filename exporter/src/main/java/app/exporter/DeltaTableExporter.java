@@ -12,9 +12,7 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -72,30 +70,102 @@ public class DeltaTableExporter {
             throw new IOException("No versions found in the Delta table");
         }
 
-        // TODO: Handle case where fromVersion > latestVersion
-        // TODO: Ensure that we have all commit since 0 OR at least 1 checkpoint
+        // Handle case where fromVersion > latestVersion
+        if (fromVersion > latestVersion) {
+            throw new IOException("Requested start version " + fromVersion + 
+                " is greater than the latest available version " + latestVersion);
+        }
+
+        // Ensure we have all commits since 0 OR at least 1 checkpoint
+        boolean hasRequiredHistory = ensureRequiredHistory();
+        if (!hasRequiredHistory) {
+            throw new IOException("Cannot export table: required history not available. " +
+                "Either all commits since version 0 or at least one checkpoint file must be present.");
+        }
 
         // Use the latest available version as the end version
         actualEndVersion = latestVersion;
         LOG.info("Exporting Delta table from version {} to {} (latest)", fromVersion, actualEndVersion);
         
         // Create temporary directory if it doesn't exist
-        Files.createDirectories(Paths.get(tempDir));
+        Path tempPath = Paths.get(tempDir);
+        Files.createDirectories(tempPath);
+        
+        // Create a subfolder for the actual content to be zipped
+        Path contentTempPath = tempPath.resolve("content");
+        Files.createDirectories(contentTempPath);
+        String contentTempDir = contentTempPath.toString();
         
         // Download the Delta log files for the specified version range
-        downloadDeltaLogFiles(actualEndVersion);
+        downloadDeltaLogFiles(actualEndVersion, contentTempDir);
         
         // Download the _last_checkpoint file if it exists
-        downloadLastCheckpointFile();
+        downloadLastCheckpointFile(contentTempDir);
         
         // Scan for deletion vector files
-        scanForDeletionVectorFiles();
+        scanForDeletionVectorFiles(contentTempDir);
         
         // Generate metadata.json file
-        generateMetadataFile();
+        generateMetadataFile(contentTempDir);
         
         // Create the ZIP archive from the downloaded files
-        return createZipArchive();
+        String zipPath = createZipArchive(contentTempPath);
+        
+        // Clean up the content temp directory
+        LOG.info("Cleaning up temporary content directory: {}", contentTempPath);
+        try {
+            Files.walk(contentTempPath)
+                .sorted((a, b) -> -a.compareTo(b))
+                .forEach(path -> {
+                    try {
+                        Files.delete(path);
+                    } catch (IOException e) {
+                        LOG.warn("Failed to delete: {}", path, e);
+                    }
+                });
+        } catch (IOException e) {
+            LOG.warn("Error cleaning up temporary content directory: {}", e.getMessage());
+        }
+        
+        return zipPath;
+    }
+
+    /**
+     * Ensures that the required history is available for the export.
+     * Either all commits since version 0 or at least one checkpoint file must be present.
+     *
+     * @return true if required history is available, false otherwise
+     * @throws IOException If an I/O error occurs
+     */
+    private boolean ensureRequiredHistory() throws IOException {
+        String logDir = tablePath + "/" + DELTA_LOG_DIR;
+        
+        // Check if we're starting from version 0
+        if (fromVersion == 0) {
+            return true; // Starting from 0 means we have all history
+        }
+        
+        // Check if at least one checkpoint file exists for any version up to the fromVersion
+        for (long v = fromVersion; v >= 0; v--) {
+            String checkpointFile = String.format("%s/%020d.checkpoint.parquet", logDir, v);
+            if (storageProvider.fileExists(checkpointFile)) {
+                LOG.info("Found checkpoint file for version {}", v);
+                return true;
+            }
+        }
+        
+        // Check if all commits exist from 0 to fromVersion
+        boolean hasAllCommits = true;
+        for (long v = 0; v < fromVersion; v++) {
+            String jsonLogFile = String.format("%s/%020d.json", logDir, v);
+            if (!storageProvider.fileExists(jsonLogFile)) {
+                LOG.warn("Missing commit log file for version {}", v);
+                hasAllCommits = false;
+                break;
+            }
+        }
+        
+        return hasAllCommits;
     }
 
     /**
@@ -138,13 +208,14 @@ public class DeltaTableExporter {
      * Downloads Delta log files for the specified version range.
      * 
      * @param actualToVersion The actual ending version to use (latest available)
+     * @param contentTempDir The temporary directory to use for downloaded content
      * @throws IOException If an I/O error occurs
      */
-    private void downloadDeltaLogFiles(long actualToVersion) throws IOException {
+    private void downloadDeltaLogFiles(long actualToVersion, String contentTempDir) throws IOException {
         LOG.info("Downloading Delta log files from version {} to {}", fromVersion, actualToVersion);
         
         String logDir = tablePath + "/" + DELTA_LOG_DIR;
-        String localLogDir = tempDir + "/" + DELTA_LOG_DIR;
+        String localLogDir = contentTempDir + "/" + DELTA_LOG_DIR;
         Files.createDirectories(Paths.get(localLogDir));
         
         for (long v = fromVersion; v <= actualToVersion; v++) {
@@ -158,7 +229,7 @@ public class DeltaTableExporter {
                 storageProvider.downloadFile(jsonLogPath, localJsonLogPath);
                 
                 // Process the log file to download data files
-                processLogFile(localJsonLogPath);
+                processLogFile(localJsonLogPath, contentTempDir);
             } else {
                 LOG.warn("Delta log file not found: {}", jsonLogFile);
             }
@@ -169,208 +240,170 @@ public class DeltaTableExporter {
             String localCheckpointPath = localLogDir + "/" + checkpointFile;
             
             if (storageProvider.fileExists(checkpointPath)) {
-                LOG.info("Downloading Delta checkpoint file: {}", checkpointFile);
+                LOG.info("Downloading checkpoint file: {}", checkpointFile);
                 storageProvider.downloadFile(checkpointPath, localCheckpointPath);
             }
         }
-        
-        LOG.info("Delta log files downloaded successfully");
     }
 
     /**
-     * Downloads the _last_checkpoint file if it exists in the source table.
-     * This file is important for Delta Lake's state management.
-     * 
+     * Downloads the _last_checkpoint file if it exists.
+     *
+     * @param contentTempDir The temporary directory to use for downloaded content 
      * @throws IOException If an I/O error occurs
      */
-    private void downloadLastCheckpointFile() throws IOException {
+    private void downloadLastCheckpointFile(String contentTempDir) throws IOException {
         LOG.info("Checking for _last_checkpoint file");
         
-        String lastCheckpointPath = tablePath + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
-        String localLastCheckpointPath = tempDir + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
+        String checkpointPath = tablePath + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
+        String localCheckpointPath = contentTempDir + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
         
-        if (storageProvider.fileExists(lastCheckpointPath)) {
+        if (storageProvider.fileExists(checkpointPath)) {
             LOG.info("Downloading _last_checkpoint file");
-            storageProvider.downloadFile(lastCheckpointPath, localLastCheckpointPath);
+            storageProvider.downloadFile(checkpointPath, localCheckpointPath);
         } else {
             LOG.info("_last_checkpoint file not found");
         }
     }
 
     /**
-     * Processes a Delta log file to extract and download referenced data files.
-     * 
-     * @param logFilePath The local path to the log file
+     * Scans the Delta log files for deletion vector files and downloads them.
+     *
+     * @param contentTempDir The temporary directory to use for downloaded content
      * @throws IOException If an I/O error occurs
      */
-    private void processLogFile(String logFilePath) throws IOException {
+    private void scanForDeletionVectorFiles(String contentTempDir) throws IOException {
+        LOG.info("Scanning for deletion vector files");
+        
+        String localLogDir = contentTempDir + "/" + DELTA_LOG_DIR;
+        File logDir = new File(localLogDir);
+        
+        // Check if the directory exists
+        if (!logDir.exists() || !logDir.isDirectory()) {
+            LOG.warn("Delta log directory not found: {}", localLogDir);
+            return;
+        }
+        
+        // Get all JSON log files
+        File[] logFiles = logDir.listFiles((dir, name) -> name.endsWith(".json"));
+        if (logFiles != null) {
+            for (File logFile : logFiles) {
+                try (FileReader reader = new FileReader(logFile);
+                     BufferedReader bufferedReader = new BufferedReader(reader)) {
+                    String line;
+                    while ((line = bufferedReader.readLine()) != null) {
+                        if (line.contains("deletionVector")) {
+                            // Parse the deletion vector file path
+                            try {
+                                DeltaLogEntry entry = gson.fromJson(line, DeltaLogEntry.class);
+                                if (entry != null && entry.getAdd() != null && entry.getAdd().getDeletionVector() != null) {
+                                    DeltaLogEntry.DeletionVector dv = entry.getAdd().getDeletionVector();
+                                    // Try various path fields that might be present
+                                    if (dv.getDvFile() != null && !dv.getDvFile().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getDvFile(), contentTempDir);
+                                    }
+                                    if (dv.getStoragePath() != null && !dv.getStoragePath().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getStoragePath(), contentTempDir);
+                                    }
+                                    if (dv.getPathOrInlineDv() != null && !dv.getPathOrInlineDv().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getPathOrInlineDv(), contentTempDir);
+                                    }
+                                }
+                                
+                                // Also check remove operations
+                                if (entry != null && entry.getRemove() != null && entry.getRemove().getDeletionVector() != null) {
+                                    DeltaLogEntry.DeletionVector dv = entry.getRemove().getDeletionVector();
+                                    // Try various path fields that might be present
+                                    if (dv.getDvFile() != null && !dv.getDvFile().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getDvFile(), contentTempDir);
+                                    }
+                                    if (dv.getStoragePath() != null && !dv.getStoragePath().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getStoragePath(), contentTempDir);
+                                    }
+                                    if (dv.getPathOrInlineDv() != null && !dv.getPathOrInlineDv().isEmpty()) {
+                                        downloadDeletionVectorFile(dv.getPathOrInlineDv(), contentTempDir);
+                                    }
+                                }
+                                
+                                // Check for deletion vector descriptors
+                                if (entry != null && entry.getAdd() != null && 
+                                    entry.getAdd().getDeletionVectorDescriptor() != null && 
+                                    entry.getAdd().getDeletionVectorDescriptor().getStoragePath() != null) {
+                                    downloadDeletionVectorFile(
+                                        entry.getAdd().getDeletionVectorDescriptor().getStoragePath(), 
+                                        contentTempDir
+                                    );
+                                }
+                            } catch (Exception e) {
+                                LOG.warn("Error parsing deletion vector from log entry: {}", e.getMessage());
+                            }
+                        }
+                    }
+                } catch (IOException e) {
+                    LOG.warn("Error reading log file: {}", logFile.getName(), e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Processes a Delta log file to find and download data files.
+     *
+     * @param logFilePath The path to the local log file
+     * @param contentTempDir The temporary directory to use for downloaded content
+     * @throws IOException If an I/O error occurs
+     */
+    private void processLogFile(String logFilePath, String contentTempDir) throws IOException {
         LOG.info("Processing log file: {}", logFilePath);
         
-        // Parse the log file
-        List<DeltaLogEntry> logEntries = parseLogFile(logFilePath);
-        LOG.info("Found {} log entries", logEntries.size());
-        
-        // Process each log entry
-        for (DeltaLogEntry logEntry : logEntries) {
-            processLogEntry(logEntry);
-        }
-    }
-
-    /**
-     * Parses a Delta log file into a list of DeltaLogEntry objects.
-     * 
-     * @param logFilePath The local path to the log file
-     * @return A list of parsed DeltaLogEntry objects
-     * @throws IOException If an I/O error occurs
-     */
-    private List<DeltaLogEntry> parseLogFile(String logFilePath) throws IOException {
-        List<DeltaLogEntry> entries = new ArrayList<>();
-        
-        try (BufferedReader reader = new BufferedReader(new FileReader(logFilePath))) {
+        try (FileReader reader = new FileReader(logFilePath);
+             BufferedReader bufferedReader = new BufferedReader(reader)) {
             String line;
-            while ((line = reader.readLine()) != null) {
-                if (!line.trim().isEmpty()) {
-                    DeltaLogEntry entry = gson.fromJson(line, DeltaLogEntry.class);
-                    entries.add(entry);
+            while ((line = bufferedReader.readLine()) != null) {
+                // Look for "add" actions with "path" fields
+                if (line.contains("\"add\"") && line.contains("\"path\"")) {
+                    // Parse the data file path
+                    try {
+                        DeltaLogEntry entry = gson.fromJson(line, DeltaLogEntry.class);
+                        if (entry != null && entry.getAdd() != null) {
+                            String dataFilePath = entry.getAdd().getPath();
+                            downloadDataFile(dataFilePath, contentTempDir);
+                        }
+                    } catch (Exception e) {
+                        LOG.warn("Error parsing data file from log entry: {}", e.getMessage());
+                    }
                 }
             }
         }
-        
-        return entries;
     }
 
     /**
-     * Processes a single Delta log entry to extract and download referenced files.
-     * 
-     * @param logEntry The Delta log entry to process
+     * Downloads a data file from the Delta table.
+     *
+     * @param dataFilePath The path to the data file (relative to the table path)
+     * @param contentTempDir The temporary directory to use for downloaded content
      * @throws IOException If an I/O error occurs
      */
-    private void processLogEntry(DeltaLogEntry logEntry) throws IOException {
-        // Process "add" actions to download data files
-        if (logEntry.getAdd() != null) {
-            String dataFilePath = logEntry.getAdd().getPath();
-            downloadDataFile(dataFilePath);
-            
-            // Check for deletion vectors in add operations
-            if (logEntry.getAdd().getDeletionVector() != null) {
-                processStandardDeletionVectorFormats(logEntry.getAdd().getDeletionVector());
-            }
-            
-            // Check for deletion vector descriptor in add operations
-            if (logEntry.getAdd().getDeletionVectorDescriptor() != null) {
-                if (logEntry.getAdd().getDeletionVectorDescriptor().getStoragePath() != null) {
-                    downloadDeletionVectorFile(logEntry.getAdd().getDeletionVectorDescriptor().getStoragePath());
-                }
-            }
-        }
+    private void downloadDataFile(String dataFilePath, String contentTempDir) throws IOException {
+        LOG.debug("Downloading data file: {}", dataFilePath);
         
-        // Check for deletion vectors in remove operations
-        if (logEntry.getRemove() != null && logEntry.getRemove().getDeletionVector() != null) {
-            processStandardDeletionVectorFormats(logEntry.getRemove().getDeletionVector());
-        }
-    }
-
-    /**
-     * Process the standard deletion vector formats: dvFile and storagePath
-     * 
-     * @param dv The deletion vector object from the log entry
-     * @throws IOException If an I/O error occurs
-     */
-    private void processStandardDeletionVectorFormats(DeltaLogEntry.DeletionVector dv) throws IOException {
-        // Check for files referenced by the deletion vector
-        if (dv.getDvFile() != null && !dv.getDvFile().isEmpty()) {
-            String dvFilePath = dv.getDvFile();
-            downloadDeletionVectorFile(dvFilePath);
-        }
-        
-        if (dv.getStoragePath() != null && !dv.getStoragePath().isEmpty()) {
-            String dvStoragePath = dv.getStoragePath();
-            downloadDeletionVectorFile(dvStoragePath);
-        }
-    }
-
-    /**
-     * Scans for deletion vector files in the source table root directory
-     * 
-     * @throws IOException If an I/O error occurs
-     */
-    private void scanForDeletionVectorFiles() throws IOException {
-        LOG.info("Scanning for deletion vector files in Delta table root");
-        
-        // Check for deletion vector directory
-        String dvDirectoryPath = tablePath + "/deletion_vector";
-        
-        if (storageProvider.fileExists(dvDirectoryPath)) {
-            LOG.info("Found deletion_vector directory, downloading files");
-            
-            // List files in the deletion_vector directory (use ".*" to match all files)
-            List<String> dvFiles = storageProvider.listFiles(dvDirectoryPath, ".*");
-            
-            for (String dvFile : dvFiles) {
-                // Get the relative path to the deletion vector file
-                String relativePath = "deletion_vector/" + dvFile;
-                downloadDeletionVectorFile(relativePath);
-            }
-        } else {
-            LOG.info("No deletion_vector directory found");
-        }
-    }
-
-    /**
-     * Downloads a deletion vector file from the source filesystem to the local temporary directory.
-     * This is similar to downloadDataFile but with specific handling for deletion vector files.
-     * 
-     * @param dvFilePath The relative path to the deletion vector file
-     * @throws IOException If an I/O error occurs
-     */
-    private void downloadDeletionVectorFile(String dvFilePath) throws IOException {
-
-        // TODO: Extend the use of processedFiles to also cover data files; data files might be repeated across versions
-        // Skip if already processed
-        if (processedFiles.contains(dvFilePath)) {
-            LOG.info("Deletion vector file already processed: {}", dvFilePath);
-            return;
-        }
-        
-        if (storageProvider.fileExists(dvFilePath)) {
-            LOG.info("Downloading deletion vector file: {}", dvFilePath);
-            
-            // Create parent directories if needed
-            String localDvFilePath = Paths.get(tempDir, dvFilePath).toString();
-            Files.createDirectories(Paths.get(localDvFilePath).getParent());
-            
-            // Download the file
-            storageProvider.downloadFile(dvFilePath, localDvFilePath);
-            
-            // Mark as processed
-            processedFiles.add(dvFilePath);
-        } else {
-            LOG.warn("Deletion vector file not found: {}", dvFilePath);
-        }
-    }
-
-    /**
-     * Downloads a data file from the source filesystem to the local temporary directory.
-     * 
-     * @param dataFilePath The relative path to the data file
-     * @throws IOException If an I/O error occurs
-     */
-    private void downloadDataFile(String dataFilePath) throws IOException {
-        // Skip if already processed
+        // Skip if already processed - using processedFiles to track all file types
         if (processedFiles.contains(dataFilePath)) {
-            LOG.info("Data file already processed: {}", dataFilePath);
+            LOG.debug("Data file already processed: {}", dataFilePath);
             return;
         }
         
-        if (storageProvider.fileExists(dataFilePath)) {
-            LOG.info("Downloading data file: {}", dataFilePath);
-            
+        // Get the full path to the data file
+        String fullDataFilePath = tablePath + "/" + dataFilePath;
+        String localDataFilePath = contentTempDir + "/" + dataFilePath;
+        
+        // Check if the file exists
+        if (storageProvider.fileExists(fullDataFilePath)) {
             // Create parent directories if needed
-            String localDataFilePath = Paths.get(tempDir, dataFilePath).toString();
             Files.createDirectories(Paths.get(localDataFilePath).getParent());
             
             // Download the file
-            storageProvider.downloadFile(dataFilePath, localDataFilePath);
+            storageProvider.downloadFile(fullDataFilePath, localDataFilePath);
             
             // Mark as processed
             processedFiles.add(dataFilePath);
@@ -380,18 +413,54 @@ public class DeltaTableExporter {
     }
 
     /**
-     * Generates a metadata.json file with information about the export.
+     * Downloads a deletion vector file from the Delta table.
      *
+     * @param dvFilePath The path to the deletion vector file (relative to the table path)
+     * @param contentTempDir The temporary directory to use for downloaded content
      * @throws IOException If an I/O error occurs
      */
-    private void generateMetadataFile() throws IOException {
+    private void downloadDeletionVectorFile(String dvFilePath, String contentTempDir) throws IOException {
+        // Skip if already processed - using processedFiles to track all file types
+        if (processedFiles.contains(dvFilePath)) {
+            LOG.info("Deletion vector file already processed: {}", dvFilePath);
+            return;
+        }
+        
+        LOG.info("Downloading deletion vector file: {}", dvFilePath);
+        
+        // Get the full path to the DV file
+        String fullDvFilePath = tablePath + "/" + dvFilePath;
+        String localDvFilePath = contentTempDir + "/" + dvFilePath;
+        
+        // Check if the file exists
+        if (storageProvider.fileExists(fullDvFilePath)) {
+            // Create parent directories if needed
+            Files.createDirectories(Paths.get(localDvFilePath).getParent());
+            
+            // Download the file
+            storageProvider.downloadFile(fullDvFilePath, localDvFilePath);
+            
+            // Mark as processed
+            processedFiles.add(dvFilePath);
+        } else {
+            LOG.warn("Deletion vector file not found: {}", fullDvFilePath);
+        }
+    }
+
+    /**
+     * Generates a metadata.json file with information about the export.
+     *
+     * @param contentTempDir The temporary directory to use for downloaded content
+     * @throws IOException If an I/O error occurs
+     */
+    private void generateMetadataFile(String contentTempDir) throws IOException {
         LOG.info("Generating export metadata file");
         
         // Create metadata object
         ExportMetadata metadata = new ExportMetadata(tablePath, fromVersion, actualEndVersion);
         
         // Write metadata to file
-        String metadataPath = Paths.get(tempDir, "metadata.json").toString();
+        String metadataPath = Paths.get(contentTempDir, "metadata.json").toString();
         try (FileWriter writer = new FileWriter(metadataPath)) {
             gson.toJson(metadata, writer);
         }
@@ -402,10 +471,11 @@ public class DeltaTableExporter {
     /**
      * Creates the final ZIP archive from the downloaded files using Java's native ZIP implementation.
      *
+     * @param contentTempPath The path to the temporary directory containing the content to archive
      * @throws IOException If an I/O error occurs
      * @return The path to the created ZIP archive
      */
-    private String createZipArchive() throws IOException {
+    private String createZipArchive(Path contentTempPath) throws IOException {
         // Ensure the output path has a .zip extension
         String outputPath = outputArchivePath;
         if (!outputPath.toLowerCase().endsWith(".zip")) {
@@ -414,19 +484,17 @@ public class DeltaTableExporter {
         
         LOG.info("Creating ZIP archive: {}", outputPath);
 
-        // TODO: Handle temp directory differently; create TEMP sub-folder and clean content after ZIP creation
         // Check for empty temp directory
-        Path tempPath = Paths.get(tempDir);
-        if (!Files.exists(tempPath) || Files.list(tempPath).findAny().isEmpty()) {
+        if (!Files.exists(contentTempPath) || Files.list(contentTempPath).findAny().isEmpty()) {
             LOG.warn("No files found to add to ZIP archive");
             return outputPath; // Return the output path even though no archive will be created
         }
         
         // Debug: Log all files to be archived
         LOG.info("Files to be archived:");
-        Files.walk(tempPath).filter(Files::isRegularFile).forEach(file -> {
+        Files.walk(contentTempPath).filter(Files::isRegularFile).forEach(file -> {
             try {
-                LOG.info("  - {}: {} bytes", tempPath.relativize(file), Files.size(file));
+                LOG.info("  - {}: {} bytes", contentTempPath.relativize(file), Files.size(file));
             } catch (IOException e) {
                 LOG.warn("Error getting file size: {}", file);
             }
@@ -435,11 +503,11 @@ public class DeltaTableExporter {
         try (FileOutputStream fos = new FileOutputStream(outputPath);
              ZipOutputStream zos = new ZipOutputStream(fos)) {
             
-            Files.walk(tempPath)
+            Files.walk(contentTempPath)
                 .filter(Files::isRegularFile)
                 .forEach(file -> {
                     try {
-                        String relativePath = tempPath.relativize(file).toString();
+                        String relativePath = contentTempPath.relativize(file).toString();
                         ZipEntry zipEntry = new ZipEntry(relativePath);
                         zos.putNextEntry(zipEntry);
                         

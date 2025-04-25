@@ -70,18 +70,23 @@ public class DeltaTableImporter {
         // Extract the ZIP archive to the temporary directory
         extractZipArchive();
 
-        // TODO Make meta-data is mandatory; fail import if not present
-        // Read metadata if available
-        readMetadata();
-
-        // TODO: Ensure that there was no more version than the one in the metadata
+        // Read metadata - this is now mandatory
+        if (!readMetadata()) {
+            throw new IOException("Failed to import: metadata.json file is missing or invalid. " +
+                    "The archive may be corrupted or not a valid Delta table export.");
+        }
 
         // Initialize Spark
         initializeSpark();
 
-        // TODO: This actually validates that the ZIP is not empty. Remove this step, or at least rename the method name to clarify
-        // Validate the target Delta table
-        validateDeltaTable();
+        // Verify the extracted Delta table contents
+        verifyExtractedContents();
+        
+        // Check that there are no more versions than expected
+        if (!verifyVersionsMatch()) {
+            throw new IOException("Failed to import: found version files that exceed the version range " +
+                    "specified in metadata. The archive may be corrupted or incomplete.");
+        }
         
         // Copy the extracted files to the target location
         copyToTarget();
@@ -135,17 +140,12 @@ public class DeltaTableImporter {
                     // Ensure parent directories exist
                     Files.createDirectories(entryPath.getParent());
                     
-                    // Extract the file
-                    // TODO: Update implementation using InputStream.transferTo
+                    // Extract the file using InputStream.transferTo
                     try (InputStream is = zipFile.getInputStream(entry);
                          FileOutputStream fos = new FileOutputStream(entryPath.toFile())) {
-                        byte[] buffer = new byte[8192];
-                        int length;
-                        while ((length = is.read(buffer)) > 0) {
-                            fos.write(buffer, 0, length);
-                        }
+                        is.transferTo(fos);
+                        LOG.debug("Extracted: {}", entry.getName());
                     }
-                    LOG.debug("Extracted: {}", entry.getName());
                 }
             }
             
@@ -208,28 +208,195 @@ public class DeltaTableImporter {
     }
 
     /**
-     * Validates that the extracted files form a valid Delta table.
+     * Verifies that the extracted contents contain necessary files for a valid Delta table.
      *
-     * @throws IOException If the validation fails
+     * @throws IOException If verification fails
      */
-    private void validateDeltaTable() throws IOException {
-        LOG.info("Validating extracted Delta table");
+    private void verifyExtractedContents() throws IOException {
+        LOG.info("Verifying extracted Delta table contents");
         
-        Path deltaLogPath = Paths.get(tempDir, DELTA_LOG_DIR);
-        if (!Files.exists(deltaLogPath) || !Files.isDirectory(deltaLogPath)) {
+        File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+        if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
             throw new IOException("Invalid Delta table: _delta_log directory not found");
         }
         
-        // Check if there are any log files
-        long logFileCount = Files.list(deltaLogPath)
-                .filter(p -> p.toString().endsWith(".json"))
-                .count();
+        // Check if the directory contains any JSON log files or checkpoint files
+        File[] logFiles = deltaLogDir.listFiles(file -> 
+                file.getName().endsWith(".json") || file.getName().endsWith(".checkpoint.parquet"));
         
-        if (logFileCount == 0) {
-            throw new IOException("Invalid Delta table: No log files found in _delta_log directory");
+        if (logFiles == null || logFiles.length == 0) {
+            throw new IOException("Invalid Delta table: no log files found in _delta_log directory");
         }
         
-        LOG.info("Delta table validation successful");
+        LOG.info("Found {} log/checkpoint files in _delta_log directory", logFiles.length);
+    }
+    
+    /**
+     * Verifies that the Delta table versions match what's in the metadata.
+     *
+     * @return true if versions match, false otherwise
+     */
+    private boolean verifyVersionsMatch() {
+        LOG.info("Verifying Delta table versions match metadata");
+        
+        if (metadata == null) {
+            LOG.error("Cannot verify versions: metadata is missing");
+            return false;
+        }
+        
+        File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+        if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
+            LOG.error("Cannot verify versions: _delta_log directory not found");
+            return false;
+        }
+        
+        // Get all version files (JSON or checkpoint)
+        File[] versionFiles = deltaLogDir.listFiles(file -> {
+            String name = file.getName();
+            return (name.endsWith(".json") || name.endsWith(".checkpoint.parquet")) 
+                   && name.length() >= 20; // Long enough to contain version number
+        });
+        
+        if (versionFiles == null || versionFiles.length == 0) {
+            LOG.warn("No version files found to verify");
+            return true; // Can't verify, assume it's okay
+        }
+        
+        long highestVersion = -1;
+        
+        // Find the highest version number in file names
+        for (File file : versionFiles) {
+            String name = file.getName();
+            try {
+                // Extract the version number (first 20 chars for our format)
+                long version = Long.parseLong(name.substring(0, 20));
+                highestVersion = Math.max(highestVersion, version);
+            } catch (NumberFormatException e) {
+                LOG.warn("Could not parse version from filename: {}", name);
+            }
+        }
+        
+        // Check if the highest version exceeds what's in metadata
+        if (highestVersion > metadata.getToVersion()) {
+            LOG.error("Found version {} which exceeds the maximum version {} in metadata", 
+                    highestVersion, metadata.getToVersion());
+            return false;
+        }
+        
+        LOG.info("Verified highest version {} is within expected range (0 to {})", 
+                highestVersion, metadata.getToVersion());
+        return true;
+    }
+
+    /**
+     * Reads the metadata.json file to extract information about the exported Delta table.
+     *
+     * @return true if metadata was successfully read, false otherwise
+     */
+    private boolean readMetadata() {
+        LOG.info("Reading metadata.json file");
+        
+        File metadataFile = new File(tempDir, "metadata.json");
+        if (!metadataFile.exists()) {
+            LOG.error("metadata.json file not found in the extracted archive");
+            return false;
+        }
+        
+        try (FileReader reader = new FileReader(metadataFile)) {
+            metadata = gson.fromJson(reader, ExportMetadata.class);
+            
+            if (metadata == null) {
+                LOG.error("Failed to parse metadata.json file");
+                return false;
+            }
+            
+            LOG.info("Metadata read successfully:");
+            LOG.info("  Source table path: {}", metadata.getTablePath());
+            LOG.info("  From version: {}", metadata.getFromVersion());
+            LOG.info("  To version: {}", metadata.getToVersion());
+            
+            return true;
+        } catch (Exception e) {
+            LOG.error("Error reading metadata.json file", e);
+            return false;
+        }
+    }
+
+    /**
+     * Copies the Delta log files to the target location.
+     *
+     * @throws IOException If an I/O error occurs
+     */
+    private void copyDeltaLogFiles() throws IOException {
+        LOG.info("Copying Delta log files to target");
+        
+        Path deltaLogSourcePath = Paths.get(tempDir, DELTA_LOG_DIR);
+        if (!Files.exists(deltaLogSourcePath)) {
+            LOG.error("Delta log directory not found in the extracted files");
+            throw new IOException("Delta log directory not found in the extracted files");
+        }
+        
+        // Create _delta_log directory in the target if it doesn't exist
+        String targetDeltaLogPath = targetPath + "/" + DELTA_LOG_DIR;
+        storageProvider.createDirectory(targetDeltaLogPath);
+        
+        // Copy each file in the _delta_log directory to the target location
+        Files.walk(deltaLogSourcePath)
+                .filter(Files::isRegularFile)
+                .forEach(file -> {
+                    try {
+                        String relativePath = deltaLogSourcePath.relativize(file).toString();
+                        String targetFilePath = targetPath + "/" + DELTA_LOG_DIR + "/" + relativePath;
+                        
+                        // Copy the file to the target using transferTo
+                        try (InputStream is = Files.newInputStream(file);
+                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
+                            is.transferTo(os);
+                            LOG.debug("Copied Delta log file: {}", relativePath);
+                        }
+                    } catch (IOException e) {
+                        LOG.error("Error copying Delta log file: {}", file, e);
+                        throw new UncheckedIOException(e);
+                    }
+                });
+        
+        LOG.info("Delta log files copied successfully");
+    }
+
+    /**
+     * Copies the data files to the target location.
+     *
+     * @throws IOException If an I/O error occurs
+     */
+    private void copyDataFiles() throws IOException {
+        LOG.info("Copying data files to target");
+        
+        Path tempDirPath = Paths.get(tempDir);
+        Path deltaLogPath = tempDirPath.resolve(DELTA_LOG_DIR);
+        Path metadataPath = tempDirPath.resolve("metadata.json");
+        
+        // Copy all files except for files in _delta_log directory and metadata.json
+        Files.walk(tempDirPath)
+                .filter(Files::isRegularFile)
+                .filter(file -> !file.startsWith(deltaLogPath) && !file.equals(metadataPath))
+                .forEach(file -> {
+                    try {
+                        String relativePath = tempDirPath.relativize(file).toString();
+                        String targetFilePath = targetPath + "/" + relativePath;
+
+                        // Copy the file to the target using transferTo
+                        try (InputStream is = Files.newInputStream(file);
+                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
+                            is.transferTo(os);
+                            LOG.debug("Copied data file: {}", relativePath);
+                        }
+                    } catch (IOException e) {
+                        LOG.error("Error copying data file: {}", file, e);
+                        throw new UncheckedIOException(e);
+                    }
+                });
+        
+        LOG.info("Data files copied successfully");
     }
 
     /**
@@ -256,88 +423,13 @@ public class DeltaTableImporter {
             storageProvider.createDirectory(targetPath + "/" + DELTA_LOG_DIR);
         }
         
-        // First, specifically ensure _delta_log directory and files are copied correctly
-        Path deltaLogSourcePath = Paths.get(tempDir, DELTA_LOG_DIR);
-        if (Files.exists(deltaLogSourcePath) && Files.isDirectory(deltaLogSourcePath)) {
-            try (java.util.stream.Stream<Path> deltaLogFiles = Files.list(deltaLogSourcePath)) {
-                deltaLogFiles.forEach(file -> {
-                    try {
-                        String relativePath = deltaLogSourcePath.relativize(file).toString();
-                        String targetFilePath = targetPath + "/" + DELTA_LOG_DIR + "/" + relativePath;
-                        
-                        // TODO: Update implementation using InputStream.transferTo
-                        // Copy the file to the target
-                        try (InputStream is = Files.newInputStream(file);
-                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = is.read(buffer)) != -1) {
-                                os.write(buffer, 0, bytesRead);
-                            }
-                        }
-                        
-                        LOG.debug("Copied _delta_log file: {}", relativePath);
-                    } catch (IOException e) {
-                        LOG.error("Error copying _delta_log file: {}", file, e);
-                    }
-                });
-            }
-        }
+        // Copy Delta log files
+        copyDeltaLogFiles();
         
-        // Then copy data files
-        Path tempDirPath = Paths.get(tempDir);
-        try (java.util.stream.Stream<Path> dataFiles = Files.walk(tempDirPath)) {
-            dataFiles
-                .filter(Files::isRegularFile)
-                .forEach(file -> {
-                    try {
-                        // Skip _delta_log files as we've already handled them
-                        if (file.toString().contains(DELTA_LOG_DIR)) {
-                            return;
-                        }
-                        
-                        String relativePath = tempDirPath.relativize(file).toString();
-                        String targetFilePath = targetPath + "/" + relativePath;
-
-                        // TODO: Update implementation using InputStream.transferTo
-                        // Copy the file to the target
-                        try (InputStream is = Files.newInputStream(file);
-                             OutputStream os = storageProvider.getOutputStream(targetFilePath)) {
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = is.read(buffer)) != -1) {
-                                os.write(buffer, 0, bytesRead);
-                            }
-                        }
-                        
-                        LOG.debug("Copied data file: {}", relativePath);
-                    } catch (IOException e) {
-                        LOG.error("Error copying data file: {}", file, e);
-                    }
-                });
-        }
+        // Copy data files
+        copyDataFiles();
         
         LOG.info("Files copied successfully to target location");
-    }
-
-    /**
-     * Reads the metadata file if it exists.
-     */
-    private void readMetadata() {
-        try {
-            Path metadataPath = Paths.get(tempDir, "export_metadata.json");
-            if (Files.exists(metadataPath)) {
-                String json = Files.readString(metadataPath);
-                metadata = gson.fromJson(json, ExportMetadata.class);
-                LOG.info("Read export metadata: table={}, fromVersion={}, toVersion={}, exportTime={}",
-                        metadata.getTableName(), metadata.getFromVersion(),
-                        metadata.getToVersion(), metadata.getExportTimestamp());
-            } else {
-                LOG.info("No metadata file found");
-            }
-        } catch (Exception e) {
-            LOG.warn("Error reading metadata file", e);
-        }
     }
 
     /**
