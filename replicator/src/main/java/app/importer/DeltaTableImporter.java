@@ -1,7 +1,10 @@
 package app.importer;
 
+import app.common.Utils;
 import app.common.model.ExportMetadata;
+import app.common.storage.S3Settings;
 import app.common.storage.StorageProvider;
+import app.common.storage.StorageProviderFactory;
 import com.google.gson.Gson;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.delta.DeltaLog;
@@ -22,7 +25,6 @@ import java.util.zip.ZipFile;
  */
 public class DeltaTableImporter {
     private static final Logger LOG = LoggerFactory.getLogger(DeltaTableImporter.class);
-    private static final String DELTA_LOG_DIR = "_delta_log";
 
     private final String archivePath;
     private final String targetPath;
@@ -42,17 +44,17 @@ public class DeltaTableImporter {
      * @param tempDir          The temporary directory to use for extracting files
      * @param overwrite        Whether to overwrite the target table if it exists
      * @param mergeSchema      Whether to merge the schema with the existing table if it exists
-     * @param storageProvider  The storage provider to use for file operations
+     * @param s3Settings       S3 settings for connecting to S3 or S3-compatible storage
      */
-    public DeltaTableImporter(String archivePath, String targetPath, String tempDir, 
-                             boolean overwrite, boolean mergeSchema,
-                             StorageProvider storageProvider) {
+    public DeltaTableImporter(String archivePath, String targetPath, String tempDir,
+                              boolean overwrite, boolean mergeSchema,
+                              S3Settings s3Settings) throws IOException {
         this.archivePath = archivePath;
         this.targetPath = targetPath;
         this.tempDir = tempDir;
         this.overwrite = overwrite;
         this.mergeSchema = mergeSchema;
-        this.storageProvider = storageProvider;
+        this.storageProvider = StorageProviderFactory.createProvider(targetPath, s3Settings);
         this.gson = new Gson();
     }
 
@@ -156,7 +158,7 @@ public class DeltaTableImporter {
             listFiles(new File(tempDir), "");
             
             // Check if _delta_log directory exists in the extracted files
-            File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+            File deltaLogDir = new File(Utils.getDeltaLogPath(tempDir));
             if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
                 LOG.error("_delta_log directory not found in extracted archive");
                 // Try listing all directories to help diagnose
@@ -215,7 +217,7 @@ public class DeltaTableImporter {
     private void verifyExtractedContents() throws IOException {
         LOG.info("Verifying extracted Delta table contents");
         
-        File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+        File deltaLogDir = new File(Utils.getDeltaLogPath(tempDir));
         if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
             throw new IOException("Invalid Delta table: _delta_log directory not found");
         }
@@ -244,7 +246,7 @@ public class DeltaTableImporter {
             return false;
         }
         
-        File deltaLogDir = new File(tempDir, DELTA_LOG_DIR);
+        File deltaLogDir = new File(Utils.getDeltaLogPath(tempDir));
         if (!deltaLogDir.exists() || !deltaLogDir.isDirectory()) {
             LOG.error("Cannot verify versions: _delta_log directory not found");
             return false;
@@ -330,14 +332,14 @@ public class DeltaTableImporter {
     private void copyDeltaLogFiles() throws IOException {
         LOG.info("Copying Delta log files to target");
         
-        Path deltaLogSourcePath = Paths.get(tempDir, DELTA_LOG_DIR);
+        Path deltaLogSourcePath = Paths.get(Utils.getDeltaLogPath(tempDir));
         if (!Files.exists(deltaLogSourcePath)) {
             LOG.error("Delta log directory not found in the extracted files");
             throw new IOException("Delta log directory not found in the extracted files");
         }
         
         // Create _delta_log directory in the target if it doesn't exist
-        String targetDeltaLogPath = targetPath + "/" + DELTA_LOG_DIR;
+        String targetDeltaLogPath = Utils.getDeltaLogPath(targetPath);
         storageProvider.createDirectory(targetDeltaLogPath);
         
         // Copy each file in the _delta_log directory to the target location
@@ -346,7 +348,7 @@ public class DeltaTableImporter {
                 .forEach(file -> {
                     try {
                         String relativePath = deltaLogSourcePath.relativize(file).toString();
-                        String targetFilePath = targetPath + "/" + DELTA_LOG_DIR + "/" + relativePath;
+                        String targetFilePath = Utils.getDeltaLogPath(targetPath) + "/" + relativePath;
                         
                         // Copy the file to the target using transferTo
                         try (InputStream is = Files.newInputStream(file);
@@ -372,7 +374,7 @@ public class DeltaTableImporter {
         LOG.info("Copying data files to target");
         
         Path tempDirPath = Paths.get(tempDir);
-        Path deltaLogPath = tempDirPath.resolve(DELTA_LOG_DIR);
+        Path deltaLogPath = Path.of(Utils.getDeltaLogPath(tempDir));
         Path metadataPath = tempDirPath.resolve("metadata.json");
         
         // Copy all files except for files in _delta_log directory and metadata.json
@@ -412,7 +414,7 @@ public class DeltaTableImporter {
             if (overwrite) {
                 LOG.info("Target exists, overwriting as requested");
                 // If we're overwriting, we need to ensure the _delta_log directory exists
-                storageProvider.createDirectory(targetPath + "/" + DELTA_LOG_DIR);
+                storageProvider.createDirectory(Utils.getDeltaLogPath(targetPath));
             } else if (!mergeSchema) {
                 throw new IOException("Target path already exists. Use --overwrite to replace it or --merge-schema to merge with it.");
             }
@@ -420,7 +422,7 @@ public class DeltaTableImporter {
             // Create target directory if it doesn't exist
             storageProvider.createDirectory(targetPath);
             // Ensure _delta_log directory exists
-            storageProvider.createDirectory(targetPath + "/" + DELTA_LOG_DIR);
+            storageProvider.createDirectory(Utils.getDeltaLogPath(targetPath));
         }
         
         // Copy Delta log files

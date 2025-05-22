@@ -1,15 +1,21 @@
 package app.integration;
 
+import app.common.storage.S3Settings;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.apache.spark.sql.functions.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -20,35 +26,104 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 public abstract class AbstractIntegrationTest {
 
     protected static final Logger LOG = LoggerFactory.getLogger(AbstractIntegrationTest.class);
-    protected static SparkSession spark;
+
+    protected SparkSession spark;
     
     @TempDir
-    protected static Path tempDir;
-    
+    protected Path tempDir;
+
+    protected String sourceTablePath;
+    protected String targetTablePath;
+
+    /**
+     * Counts files in the given directory by their extension.
+     *
+     * @param files The list of files to count
+     * @return A map of extension to count
+     */
+    protected Map<String, Long> countFileTypesByExtension(List<String> files) throws IOException {
+        return files.stream()
+                .collect(Collectors.groupingBy(
+                        file -> {
+                            if (file.endsWith(".checkpoint.parquet")) {
+                                return ".checkpoint.parquet";
+                            } else if (file.endsWith(".json")) {
+                                return ".json";
+                            } else {
+                                int lastDotIndex = file.lastIndexOf('.');
+                                return lastDotIndex == -1 ? "(no extension)" : file.substring(lastDotIndex);
+                            }
+                        },
+                        Collectors.counting()
+                ));
+    }
+    protected Path zipFilesPath;
+    protected Path exportTempDir;
+    protected Path importTempDir;
+
+    @BeforeEach
+    public void setupLocalPaths() throws IOException {
+        importTempDir = tempDir.resolve("import");
+        Files.createDirectories(importTempDir);
+        exportTempDir = tempDir.resolve("export");
+        Files.createDirectories(exportTempDir);
+        zipFilesPath = tempDir.resolve("zip");
+        Files.createDirectories(zipFilesPath);
+    }
+
+    @BeforeEach
+    public void createSourceAndTargetPaths() throws IOException {
+        Path sourceTablePath = tempDir.resolve("source-table");
+        Files.createDirectories(sourceTablePath);
+        this.sourceTablePath = sourceTablePath.toString();
+
+        Path targetTablePath = tempDir.resolve("target-table");
+        Files.createDirectories(targetTablePath);
+        this.targetTablePath = targetTablePath.toString();
+    }
+
     /**
      * Sets up the test environment, including SparkSession initialization.
      */
-    @BeforeAll
-    public static void setup() {
-        // Initialize Spark with appropriate configurations
-        spark = SparkSession.builder()
-                .appName("DeltaTableIntegrationTest")
+    @BeforeEach
+    public void setupSparkSession() {
+        // Initialize Spark with default configuration
+        SparkSession.Builder builder = SparkSession.builder()
+                .appName(this.getClass().getSimpleName())
                 .master("local[*]")
                 .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-                .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-                .getOrCreate();
+                .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog");
+        // Let subclasses customize the Spark session
+        builder = customizeSparkSession(builder);
+        // Create session
+        spark = builder.getOrCreate();
     }
-    
+
+    protected SparkSession.Builder customizeSparkSession(SparkSession.Builder builder) {
+        // NO-OP by default
+        return builder;
+    };
+
+    protected S3Settings getS3Settings() {
+        // NO-OP by default
+        return S3Settings.defaultSettings();
+    }
+
     /**
      * Tears down the test environment and cleans up resources.
      */
-    @AfterAll
-    public static void tearDown() {
+    @AfterEach
+    public void closeSparkSession() {
         if (spark != null) {
             spark.close();
         }
     }
-    
+
+    public void resetSparkSession() {
+        closeSparkSession();
+        setupSparkSession();
+    }
+
     /**
      * Verifies that the imported table matches the source table.
      *
@@ -57,8 +132,7 @@ public abstract class AbstractIntegrationTest {
      */
     protected void verifyImportedTable(String sourcePath, String targetPath) {
         // Reset Spark session as the underlying table have been updated by the test
-        tearDown();
-        setup();
+        resetSparkSession();
         
         // Read both tables
         Dataset<Row> sourceDF = spark.read().format("delta").load(sourcePath);

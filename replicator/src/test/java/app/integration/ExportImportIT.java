@@ -1,7 +1,6 @@
 package app.integration;
 
-import app.common.storage.StorageProvider;
-import app.common.storage.StorageProviderFactory;
+import app.common.storage.S3Settings;
 import app.exporter.DeltaTableExporter;
 import app.importer.DeltaTableImporter;
 import org.apache.spark.sql.Dataset;
@@ -32,39 +31,19 @@ public class ExportImportIT extends AbstractIntegrationTest {
      */
     @Test
     public void testExportImportCycle() throws IOException {
-        // Create source directory for the Delta table
-        Path sourceTablePath = tempDir.resolve("source_table");
-        Files.createDirectories(sourceTablePath);
-        
-        // Create target directory for the import
-        Path targetTablePath = tempDir.resolve("target_table");
-        Files.createDirectories(targetTablePath);
-        
-        // Create temp directory for the export/import process
-        Path exportTempDir = tempDir.resolve("export_temp");
-        Files.createDirectories(exportTempDir);
-        Path importTempDir = tempDir.resolve("import_temp");
-        Files.createDirectories(importTempDir);
-        
-        // Create a zip file path for the export
-        String zipFilePath = tempDir.resolve("delta_export.zip").toString();
-        
+
         // Create a simple Delta table with test data
-        createTestDeltaTable(sourceTablePath.toString());
+        createTestDeltaTable(sourceTablePath);
         
         // Get the source table version
-        DeltaLog sourceLog = DeltaLog.forTable(spark, sourceTablePath.toString());
+        DeltaLog sourceLog = DeltaLog.forTable(spark, sourceTablePath);
         long sourceVersion = sourceLog.currentSnapshot().snapshot().version();
         
         LOG.info("Source table created with version: {}", sourceVersion);
         
-        // Create storage provider for the source table
-        StorageProvider sourceStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + sourceTablePath.toString());
-        
         // Export the Delta table
         DeltaTableExporter exporter = new DeltaTableExporter(
-                sourceTablePath.toString(), 0, zipFilePath, exportTempDir.toString(), sourceStorageProvider);
+                sourceTablePath, 0, zipFilesPath.toString(), exportTempDir.toString(), getS3Settings());
         
         String exportedZipPath = exporter.export();
         LOG.info("Exported Delta table to: {}", exportedZipPath);
@@ -74,23 +53,19 @@ public class ExportImportIT extends AbstractIntegrationTest {
         assertTrue(zipFile.exists(), "Export ZIP file should exist");
         assertTrue(zipFile.length() > 0, "Export ZIP file should not be empty");
         
-        // Create storage provider for the target table
-        StorageProvider targetStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + targetTablePath.toString());
-        
         // Import the Delta table
         DeltaTableImporter importer = new DeltaTableImporter(
-                zipFilePath, targetTablePath.toString(), importTempDir.toString(), 
-                true, false, targetStorageProvider);
+                exportedZipPath, targetTablePath, importTempDir.toString(),
+                true, false, getS3Settings());
         
         importer.importTable();
         LOG.info("Imported Delta table to: {}", targetTablePath);
         
         // Verify the import was successful
-        verifyImportedTable(sourceTablePath.toString(), targetTablePath.toString());
+        verifyImportedTable(sourceTablePath, targetTablePath);
         
         // Verify the table versions
-        DeltaLog targetLog = DeltaLog.forTable(spark, targetTablePath.toString());
+        DeltaLog targetLog = DeltaLog.forTable(spark, targetTablePath);
         long targetVersion = targetLog.currentSnapshot().snapshot().version();
 
         LOG.info("Target table imported with version: {}", targetVersion);
@@ -128,13 +103,9 @@ public class ExportImportIT extends AbstractIntegrationTest {
 
         LOG.info("Source table created with version: {}", sourceVersion);
 
-        // Create storage provider for the source table
-        StorageProvider sourceStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + sourceTablePath.toString());
-
         // Export the Delta table
         DeltaTableExporter exporter = new DeltaTableExporter(
-                sourceTablePath.toString(), 0, zipFilePath, exportTempDir.toString(), sourceStorageProvider);
+                sourceTablePath.toString(), 0, zipFilePath, exportTempDir.toString(), S3Settings.defaultSettings());
 
         String exportedZipPath = exporter.export();
         LOG.info("Exported Delta table to: {}", exportedZipPath);
@@ -144,14 +115,10 @@ public class ExportImportIT extends AbstractIntegrationTest {
         assertTrue(zipFile.exists(), "Export ZIP file should exist");
         assertTrue(zipFile.length() > 0, "Export ZIP file should not be empty");
 
-        // Create storage provider for the target table
-        StorageProvider targetStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + targetTablePath.toString());
-
         // Import the Delta table
         DeltaTableImporter importer = new DeltaTableImporter(
                 zipFilePath, targetTablePath.toString(), importTempDir.toString(),
-                true, false, targetStorageProvider);
+                true, false, S3Settings.defaultSettings());
 
         importer.importTable();
         LOG.info("Imported Delta table to: {}", targetTablePath);

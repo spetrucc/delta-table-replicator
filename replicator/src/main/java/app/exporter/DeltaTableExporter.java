@@ -1,8 +1,11 @@
 package app.exporter;
 
+import app.common.Utils;
 import app.common.model.DeltaLogEntry;
 import app.common.model.ExportMetadata;
+import app.common.storage.S3Settings;
 import app.common.storage.StorageProvider;
+import app.common.storage.StorageProviderFactory;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import org.slf4j.Logger;
@@ -22,9 +25,8 @@ import java.util.zip.ZipOutputStream;
  * The ZIP archive contains all necessary files to replicate the table between two Delta versions.
  */
 public class DeltaTableExporter {
+
     private static final Logger LOG = LoggerFactory.getLogger(DeltaTableExporter.class);
-    private static final String DELTA_LOG_DIR = "_delta_log";
-    private static final String LAST_CHECKPOINT_FILE = "_last_checkpoint";
 
     private final String tablePath;
     private final long fromVersion;
@@ -42,19 +44,17 @@ public class DeltaTableExporter {
      * @param fromVersion   The starting version to export (inclusive)
      * @param outputArchivePath The local path where the ZIP archive will be created
      * @param tempDir       The temporary directory to use for downloading files
-     * @param storageProvider The storage provider to use for file operations
+     * @param s3Settings    S3 settings if the tablePath is an S3 path
      */
-    public DeltaTableExporter(String tablePath, long fromVersion,
-                             String outputArchivePath, String tempDir,
-                             StorageProvider storageProvider) {
+    public DeltaTableExporter(String tablePath, long fromVersion, String outputArchivePath, String tempDir, S3Settings s3Settings) throws IOException {
         this.tablePath = tablePath;
         this.fromVersion = fromVersion;
         this.outputArchivePath = outputArchivePath;
         this.tempDir = tempDir;
+        this.storageProvider = StorageProviderFactory.createProvider(tablePath, s3Settings);
+        this.actualEndVersion = -1;
         this.gson = new GsonBuilder().create();
         this.processedFiles = new HashSet<>();
-        this.storageProvider = storageProvider;
-        this.actualEndVersion = -1;
     }
 
     /**
@@ -138,7 +138,7 @@ public class DeltaTableExporter {
      * @throws IOException If an I/O error occurs
      */
     private boolean ensureRequiredHistory() throws IOException {
-        String logDir = tablePath + "/" + DELTA_LOG_DIR;
+        String logDir = Utils.getDeltaLogPath(tablePath);
         
         // Check if we're starting from version 0
         if (fromVersion == 0) {
@@ -178,7 +178,7 @@ public class DeltaTableExporter {
         LOG.info("Finding the latest available version in the Delta table");
         
         // Check for JSON files in _delta_log directory starting from the specified fromVersion
-        String logDir = tablePath + "/" + DELTA_LOG_DIR;
+        String logDir = Utils.getDeltaLogPath(tablePath);
         long latestVersion = -1;
         
         for (long v = fromVersion; ; v++) {
@@ -214,8 +214,8 @@ public class DeltaTableExporter {
     private void downloadDeltaLogFiles(long actualToVersion, String contentTempDir) throws IOException {
         LOG.info("Downloading Delta log files from version {} to {}", fromVersion, actualToVersion);
         
-        String logDir = tablePath + "/" + DELTA_LOG_DIR;
-        String localLogDir = contentTempDir + "/" + DELTA_LOG_DIR;
+        String logDir = Utils.getDeltaLogPath(tablePath);
+        String localLogDir = Utils.getDeltaLogPath(contentTempDir);
         Files.createDirectories(Paths.get(localLogDir));
         
         for (long v = fromVersion; v <= actualToVersion; v++) {
@@ -255,8 +255,8 @@ public class DeltaTableExporter {
     private void downloadLastCheckpointFile(String contentTempDir) throws IOException {
         LOG.info("Checking for _last_checkpoint file");
         
-        String checkpointPath = tablePath + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
-        String localCheckpointPath = contentTempDir + "/" + DELTA_LOG_DIR + "/" + LAST_CHECKPOINT_FILE;
+        String checkpointPath = Utils.getLastCheckpointFile(tablePath);
+        String localCheckpointPath = Utils.getLastCheckpointFile(contentTempDir);
         
         if (storageProvider.fileExists(checkpointPath)) {
             LOG.info("Downloading _last_checkpoint file");
@@ -275,7 +275,7 @@ public class DeltaTableExporter {
     private void scanForDeletionVectorFiles(String contentTempDir) throws IOException {
         LOG.info("Scanning for deletion vector files");
         
-        String localLogDir = contentTempDir + "/" + DELTA_LOG_DIR;
+        String localLogDir = Utils.getDeltaLogPath(contentTempDir);
         File logDir = new File(localLogDir);
         
         // Check if the directory exists

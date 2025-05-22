@@ -1,7 +1,5 @@
 package app.integration;
 
-import app.common.storage.StorageProvider;
-import app.common.storage.StorageProviderFactory;
 import app.exporter.DeltaTableExporter;
 import app.importer.DeltaTableImporter;
 import org.apache.spark.sql.Dataset;
@@ -12,8 +10,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 
 import static org.apache.spark.sql.functions.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,19 +35,6 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
      */
     @Test
     public void testIncrementalExportImport() throws IOException {
-        // Create source directory for the Delta table
-        Path sourceTablePath = tempDir.resolve("incremental_source_table");
-        Files.createDirectories(sourceTablePath);
-        
-        // Create target directory for the import
-        Path targetTablePath = tempDir.resolve("incremental_target_table");
-        Files.createDirectories(targetTablePath);
-        
-        // Create temp directories for the export/import process
-        Path exportTempDir = tempDir.resolve("incremental_export_temp");
-        Files.createDirectories(exportTempDir);
-        Path importTempDir = tempDir.resolve("incremental_import_temp");
-        Files.createDirectories(importTempDir);
         
         LOG.info("========== PHASE 1: INITIAL SETUP ==========");
         
@@ -66,46 +49,39 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         initialData.write()
                 .format("delta")
                 .mode("overwrite")
-                .save(sourceTablePath.toString());
+                .save(sourceTablePath);
         
         // Verify initial row count
-        Dataset<Row> sourceTable = spark.read().format("delta").load(sourceTablePath.toString());
+        Dataset<Row> sourceTable = spark.read().format("delta").load(sourceTablePath);
         long initialCount = sourceTable.count();
         LOG.info("Initial source table created with {} rows", initialCount);
         
         // Get initial source table version
-        DeltaLog sourceLog = DeltaLog.forTable(spark, sourceTablePath.toString());
+        DeltaLog sourceLog = DeltaLog.forTable(spark, sourceTablePath);
         long sourceVersion = sourceLog.currentSnapshot().snapshot().version();
         LOG.info("Initial source table version: {}", sourceVersion);
         
         // STEP 2: Export the initial Delta table
-        String initialZipPath = tempDir.resolve("initial_delta_export.zip").toString();
-        
-        StorageProvider sourceStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + sourceTablePath.toString());
-        
         DeltaTableExporter initialExporter = new DeltaTableExporter(
-                sourceTablePath.toString(), 0, initialZipPath, exportTempDir.toString(), sourceStorageProvider);
+                sourceTablePath, 0, zipFilesPath.toString(), exportTempDir.toString(), getS3Settings());
         
         String exportedInitialZipPath = initialExporter.export();
         LOG.info("Exported initial Delta table to: {}", exportedInitialZipPath);
         
         // STEP 3: Import the initial Delta table to target
-        StorageProvider targetStorageProvider = StorageProviderFactory.createProvider(
-                "file://" + targetTablePath.toString());
         
         DeltaTableImporter initialImporter = new DeltaTableImporter(
-                initialZipPath, targetTablePath.toString(), importTempDir.toString(), 
-                true, false, targetStorageProvider);
+                exportedInitialZipPath, targetTablePath, importTempDir.toString(),
+                true, false, getS3Settings());
         
         initialImporter.importTable();
         LOG.info("Imported initial Delta table to: {}", targetTablePath);
         
         // Verify initial import was successful
-        verifyImportedTable(sourceTablePath.toString(), targetTablePath.toString());
+        verifyImportedTable(sourceTablePath, targetTablePath);
         
         // Get target table version after initial import
-        DeltaLog targetLog = DeltaLog.forTable(spark, targetTablePath.toString());
+        DeltaLog targetLog = DeltaLog.forTable(spark, targetTablePath);
         long targetVersion = targetLog.currentSnapshot().snapshot().version();
         LOG.info("Target table imported with version: {}", targetVersion);
         assertEquals(sourceVersion, targetVersion, "Initial source and target table versions should match");
@@ -125,13 +101,13 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         update1Data.write()
                 .format("delta")
                 .mode("append")
-                .save(sourceTablePath.toString());
+                .save(sourceTablePath);
         
         // Update some existing rows
         spark.sql("UPDATE delta.`" + sourceTablePath + "` SET value = 'updated_first_A' WHERE category = 'A' AND id < 1000");
         
         // Get source table version after first update
-        sourceLog = DeltaLog.forTable(spark, sourceTablePath.toString());
+        sourceLog = DeltaLog.forTable(spark, sourceTablePath);
         long sourceVersionAfterUpdate1 = sourceLog.currentSnapshot().snapshot().version();
         LOG.info("Source table version after first update: {}", sourceVersionAfterUpdate1);
         
@@ -139,24 +115,24 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         String update1ZipPath = tempDir.resolve("update1_delta_export.zip").toString();
         
         DeltaTableExporter update1Exporter = new DeltaTableExporter(
-                sourceTablePath.toString(), targetVersion + 1, update1ZipPath, exportTempDir.toString(), sourceStorageProvider);
+                sourceTablePath, targetVersion + 1, update1ZipPath, exportTempDir.toString(), getS3Settings());
         
         String exportedUpdate1ZipPath = update1Exporter.export();
         LOG.info("Exported incremental update 1 to: {}", exportedUpdate1ZipPath);
         
         // STEP 6: Apply incremental update to target
         DeltaTableImporter update1Importer = new DeltaTableImporter(
-                update1ZipPath, targetTablePath.toString(), importTempDir.toString(), 
-                false, true, targetStorageProvider);
+                update1ZipPath, targetTablePath, importTempDir.toString(),
+                false, true, getS3Settings());
         
         update1Importer.importTable();
         LOG.info("Applied incremental update 1 to target table");
         
         // Verify incremental update was successful
-        verifyImportedTable(sourceTablePath.toString(), targetTablePath.toString());
+        verifyImportedTable(sourceTablePath, targetTablePath);
         
         // Get target table version after incremental update
-        targetLog = DeltaLog.forTable(spark, targetTablePath.toString());
+        targetLog = DeltaLog.forTable(spark, targetTablePath);
         long targetVersionAfterUpdate1 = targetLog.currentSnapshot().snapshot().version();
         LOG.info("Target table version after incremental update 1: {}", targetVersionAfterUpdate1);
         assertEquals(sourceVersionAfterUpdate1, targetVersionAfterUpdate1,
@@ -168,7 +144,7 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         LOG.info("Performing second update on source table");
         
         // Add more rows with additional columns
-        Dataset<Row> sourceTableWithNewSchema = spark.read().format("delta").load(sourceTablePath.toString())
+        Dataset<Row> sourceTableWithNewSchema = spark.read().format("delta").load(sourceTablePath)
                 .withColumn("updated_at", current_timestamp())
                 .withColumn("is_active", lit(true));
         
@@ -176,7 +152,7 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
                 .format("delta")
                 .mode("overwrite")
                 .option("overwriteSchema", "true")
-                .save(sourceTablePath.toString());
+                .save(sourceTablePath);
         
         // Add more data with the new schema
         Dataset<Row> update2Data = spark.range(2000, 3000)
@@ -190,13 +166,13 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         update2Data.write()
                 .format("delta")
                 .mode("append")
-                .save(sourceTablePath.toString());
+                .save(sourceTablePath);
         
         // Delete some rows
         spark.sql("DELETE FROM delta.`" + sourceTablePath + "` WHERE id % 50 = 0");
         
         // Get source table version after second update
-        sourceLog = DeltaLog.forTable(spark, sourceTablePath.toString());
+        sourceLog = DeltaLog.forTable(spark, sourceTablePath);
         long sourceVersionAfterUpdate2 = sourceLog.currentSnapshot().snapshot().version();
         LOG.info("Source table version after second update: {}", sourceVersionAfterUpdate2);
         
@@ -204,33 +180,33 @@ public class IncrementalExportImportIT extends AbstractIntegrationTest {
         String update2ZipPath = tempDir.resolve("update2_delta_export.zip").toString();
         
         DeltaTableExporter update2Exporter = new DeltaTableExporter(
-                sourceTablePath.toString(), targetVersionAfterUpdate1 + 1, update2ZipPath, exportTempDir.toString(), sourceStorageProvider);
+                sourceTablePath, targetVersionAfterUpdate1 + 1, update2ZipPath, exportTempDir.toString(), getS3Settings());
         
         String exportedUpdate2ZipPath = update2Exporter.export();
         LOG.info("Exported incremental update 2 to: {}", exportedUpdate2ZipPath);
         
         // STEP 9: Apply second incremental update to target
         DeltaTableImporter update2Importer = new DeltaTableImporter(
-                update2ZipPath, targetTablePath.toString(), importTempDir.toString(), 
-                false, true, targetStorageProvider);
+                update2ZipPath, targetTablePath, importTempDir.toString(),
+                false, true, getS3Settings());
         
         update2Importer.importTable();
         LOG.info("Applied incremental update 2 to target table");
         
         // STEP 10: Final verification
         LOG.info("Performing final verification");
-        verifyImportedTable(sourceTablePath.toString(), targetTablePath.toString());
+        verifyImportedTable(sourceTablePath, targetTablePath);
         
         // Get final target table version
-        targetLog = DeltaLog.forTable(spark, targetTablePath.toString());
+        targetLog = DeltaLog.forTable(spark, targetTablePath);
         long finalTargetVersion = targetLog.currentSnapshot().snapshot().version();
         LOG.info("Final target table version: {}", finalTargetVersion);
         assertEquals(sourceVersionAfterUpdate2, finalTargetVersion,
                 "Source and target versions should match after second incremental update");
         
         // Verify row count and schema
-        Dataset<Row> finalSourceTable = spark.read().format("delta").load(sourceTablePath.toString());
-        Dataset<Row> finalTargetTable = spark.read().format("delta").load(targetTablePath.toString());
+        Dataset<Row> finalSourceTable = spark.read().format("delta").load(sourceTablePath);
+        Dataset<Row> finalTargetTable = spark.read().format("delta").load(targetTablePath);
         LOG.info("Final source table has {} rows and {} columns", finalSourceTable.count(), finalSourceTable.columns().length);
         LOG.info("Final target table has {} rows and {} columns", finalTargetTable.count(), finalTargetTable.columns().length);
     }

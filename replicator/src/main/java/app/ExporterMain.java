@@ -1,8 +1,6 @@
 package app;
 
 import app.common.storage.S3Settings;
-import app.common.storage.StorageProvider;
-import app.common.storage.StorageProviderFactory;
 import app.exporter.DeltaTableExporter;
 import org.apache.commons.cli.*;
 import org.slf4j.Logger;
@@ -62,19 +60,8 @@ public class ExporterMain {
                 cmd.hasOption("s3-path-style-access")
             );
             
-            // Create storage provider based on the table path
-            StorageProvider storageProvider;
-            if (tablePath.startsWith("s3://") || tablePath.startsWith("s3a://")) {
-                LOG.info("Using S3 storage provider with provided credentials");
-                storageProvider = StorageProviderFactory.createProvider(tablePath, s3Settings);
-            } else {
-                LOG.info("Using local storage provider");
-                storageProvider = StorageProviderFactory.createProvider(tablePath);
-            }
-            
             // Create and run the exporter
-            DeltaTableExporter exporter = new DeltaTableExporter(
-                    tablePath, fromVersion, outputZipPath, tempDir, storageProvider);
+            DeltaTableExporter exporter = new DeltaTableExporter(tablePath, fromVersion, outputZipPath, tempDir, s3Settings);
             
             LOG.info("Starting Delta Table export process");
             String finalOutputPath = exporter.export();

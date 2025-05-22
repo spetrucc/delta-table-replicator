@@ -1,8 +1,6 @@
 package app;
 
 import app.common.storage.S3Settings;
-import app.common.storage.StorageProvider;
-import app.common.storage.StorageProviderFactory;
 import app.importer.DeltaTableImporter;
 import org.apache.commons.cli.*;
 import org.slf4j.Logger;
@@ -63,19 +61,8 @@ public class ImporterMain {
                 cmd.hasOption("s3-path-style-access")
             );
             
-            // Create storage provider based on the target path
-            StorageProvider storageProvider;
-            if (targetPath.startsWith("s3://") || targetPath.startsWith("s3a://")) {
-                LOG.info("Using S3 storage provider with provided credentials");
-                storageProvider = StorageProviderFactory.createProvider(targetPath, s3Settings);
-            } else {
-                LOG.info("Using local storage provider");
-                storageProvider = StorageProviderFactory.createProvider(targetPath);
-            }
-            
             // Create and run the importer
-            DeltaTableImporter importer = new DeltaTableImporter(
-                    archivePath, targetPath, tempDir, overwrite, mergeSchema, storageProvider);
+            DeltaTableImporter importer = new DeltaTableImporter(archivePath, targetPath, tempDir, overwrite, mergeSchema, s3Settings);
             
             LOG.info("Starting Delta Table import process");
             importer.importTable();

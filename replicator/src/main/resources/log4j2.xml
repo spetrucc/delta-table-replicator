@@ -9,6 +9,7 @@
         <!-- Mute all external libraries -->
         <Logger name="org" level="WARN" />
         <Logger name="io" level="WARN" />
+        <Logger name="com.github.dockerjava" level="INFO" />
 
         <!-- Mute Delta logs -->
         <Logger name="io.delta" level="INFO" />
